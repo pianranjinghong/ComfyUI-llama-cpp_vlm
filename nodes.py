@@ -51,7 +51,7 @@ chat_handlers = [
     "Granite-Docling"
 ]
 
-# 尝试导入各个 ChatHandler（保持原有导入逻辑，但不需要 -Thinking 版本）
+# 尝试导入各个 ChatHandler
 try:
     from llama_cpp.llama_chat_format import Gemma3ChatHandler
 except:
@@ -122,26 +122,49 @@ class LLAMA_CPP_STORAGE:
 
     @classmethod
     def clean(cls, all=False):
-        try:
-            cls.llm.close()
-        except Exception:
-            pass
-        try:
-            cls.chat_handler._exit_stack.close()
-        except Exception:
-            pass
-        cls.llm = None
-        cls.chat_handler = None
+        # 1. 关闭 LLM 实例
+        if cls.llm is not None:
+            try:
+                cls.llm.close()
+            except Exception:
+                pass
+            cls.llm = None
+
+        # 2. 安全关闭 chat_handler 的 _exit_stack（修复 Bug1）
+        if cls.chat_handler is not None:
+            try:
+                if hasattr(cls.chat_handler, '_exit_stack'):
+                    cls.chat_handler._exit_stack.close()
+            except Exception:
+                pass
+            cls.chat_handler = None
+
+        # 3. 重置配置
         cls.current_config = None
+
+        # 4. 可选：清理所有状态（对话历史等）
         if all:
             cls.clean_state()
+
+        # 5. 触发垃圾回收和 ComfyUI 缓存清理
         gc.collect()
         mm.soft_empty_cache()
 
     @classmethod
     def load_model(cls, config):
         def get_chat_handler(chat_handler):
-           
+            # 兼容旧的 -Thinking 名称（自动转换）
+            if chat_handler in ("Qwen3.5-Thinking", "Qwen3.6-Thinking", "Qwen3.5", "Qwen3.6"):
+                chat_handler = "Qwen3.5/3.6"
+            if chat_handler in ("Qwen3-VL-Thinking",):
+                chat_handler = "Qwen3-VL"
+            if chat_handler in ("MiniCPM-v4.5-Thinking",):
+                chat_handler = "MiniCPM-v4.5"
+            if chat_handler in ("GLM-4.6V-Thinking",):
+                chat_handler = "GLM-4.6V"
+            if chat_handler in ("GLM-4.1V-Thinking",):
+                chat_handler = "GLM-4.1V"
+
             match chat_handler:
                 case "Qwen3.5/3.6":
                     return Qwen35ChatHandler
@@ -1012,7 +1035,7 @@ class PromptEnhancerPreset:
             case "ideogram4":
                 return (ideogram4,)
             case "性感古风":
-                return (性感古风,)
+                return (性感古风,) 
             case _:
                 raise ValueError(f'Unknown preset: "{preset}"')
 
