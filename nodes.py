@@ -29,7 +29,7 @@ try:
 except:
     _MTMD = False
 
-# ========== 精简后的 chat_handlers（移除了所有 -Thinking 后缀，合并了 Qwen3.5/3.6） ==========
+# ========== 精简后的 chat_handlers ==========
 chat_handlers = [
     "None",
     "LLaVA-1.5",
@@ -43,7 +43,7 @@ chat_handlers = [
     "Gemma4",
     "Qwen2.5-VL",
     "Qwen3-VL",
-    "Qwen3.5/3.6",          # 合并了 Qwen3.5 和 Qwen3.6
+    "Qwen3.5/3.6",
     "GLM-4.6V",
     "GLM-4.1V",
     "LFM2-VL",
@@ -51,7 +51,7 @@ chat_handlers = [
     "Granite-Docling"
 ]
 
-# 尝试导入各个 ChatHandler
+# 导入各个 ChatHandler
 try:
     from llama_cpp.llama_chat_format import Gemma3ChatHandler
 except:
@@ -122,7 +122,7 @@ class LLAMA_CPP_STORAGE:
 
     @classmethod
     def clean(cls, all=False):
-        # 1. 关闭 LLM 实例
+        # 关闭 LLM 实例
         if cls.llm is not None:
             try:
                 cls.llm.close()
@@ -130,7 +130,7 @@ class LLAMA_CPP_STORAGE:
                 pass
             cls.llm = None
 
-        # 2. 安全关闭 chat_handler 的 _exit_stack（修复 Bug1）
+        # 安全关闭 chat_handler 的 _exit_stack
         if cls.chat_handler is not None:
             try:
                 if hasattr(cls.chat_handler, '_exit_stack'):
@@ -139,21 +139,16 @@ class LLAMA_CPP_STORAGE:
                 pass
             cls.chat_handler = None
 
-        # 3. 重置配置
         cls.current_config = None
-
-        # 4. 可选：清理所有状态（对话历史等）
         if all:
             cls.clean_state()
-
-        # 5. 触发垃圾回收和 ComfyUI 缓存清理
         gc.collect()
         mm.soft_empty_cache()
 
     @classmethod
     def load_model(cls, config):
         def get_chat_handler(chat_handler):
-            # 兼容旧的 -Thinking 名称（自动转换）
+            # 兼容旧名称
             if chat_handler in ("Qwen3.5-Thinking", "Qwen3.6-Thinking", "Qwen3.5", "Qwen3.6"):
                 chat_handler = "Qwen3.5/3.6"
             if chat_handler in ("Qwen3-VL-Thinking",):
@@ -167,10 +162,16 @@ class LLAMA_CPP_STORAGE:
 
             match chat_handler:
                 case "Qwen3.5/3.6":
+                    if Qwen35ChatHandler is None:
+                        raise ImportError("Qwen35ChatHandler not available. Please install JamePeng/llama-cpp-python.")
                     return Qwen35ChatHandler
                 case "Qwen3-VL":
+                    if Qwen3VLChatHandler is None:
+                        raise ImportError("Qwen3VLChatHandler not available.")
                     return Qwen3VLChatHandler
                 case "Qwen2.5-VL":
+                    if Qwen25VLChatHandler is None:
+                        raise ImportError("Qwen25VLChatHandler not available.")
                     return Qwen25VLChatHandler
                 case "LLaVA-1.5":
                     return Llava15ChatHandler
@@ -187,18 +188,32 @@ class LLAMA_CPP_STORAGE:
                 case "MiniCPM-v4.5":
                     return MiniCPMv26ChatHandler
                 case "Gemma3":
+                    if Gemma3ChatHandler is None:
+                        raise ImportError("Gemma3ChatHandler not available.")
                     return Gemma3ChatHandler
                 case "Gemma4":
+                    if Gemma4ChatHandler is None:
+                        raise ImportError("Gemma4ChatHandler not available. Please install JamePeng/llama-cpp-python with Gemma4 support.")
                     return Gemma4ChatHandler
                 case "GLM-4.6V":
+                    if GLM46VChatHandler is None:
+                        raise ImportError("GLM46VChatHandler not available.")
                     return GLM46VChatHandler
                 case "GLM-4.1V":
+                    if GLM41VChatHandler is None:
+                        raise ImportError("GLM41VChatHandler not available.")
                     return GLM41VChatHandler
                 case "LFM2-VL":
+                    if LFM2VLChatHandler is None:
+                        raise ImportError("LFM2VLChatHandler not available.")
                     return LFM2VLChatHandler
                 case "LFM2.5-VL":
+                    if LFM25VLChatHandler is None:
+                        raise ImportError("LFM25VLChatHandler not available.")
                     return LFM25VLChatHandler
                 case "Granite-Docling":
+                    if GraniteDoclingChatHandler is None:
+                        raise ImportError("GraniteDoclingChatHandler not available.")
                     return GraniteDoclingChatHandler
                 case "None":
                     return None
@@ -219,19 +234,29 @@ class LLAMA_CPP_STORAGE:
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
         handler = get_chat_handler(chat_handler)
 
+        # 计算 GPU 层数（改进版）
         if vram_limit != -1:
-            gguf_layers = get_layer_count(model_path) or 32
-            gguf_size = os.path.getsize(model_path) * 1.55 / (1024 ** 3)
-            gguf_layer_size = gguf_size / gguf_layers
+            try:
+                gguf_layers = get_layer_count(model_path) or 32
+                # 使用更保守的估算因子 1.2，并防止除以零
+                gguf_size = os.path.getsize(model_path) * 1.2 / (1024 ** 3)
+                gguf_layer_size = max(gguf_size / gguf_layers, 0.05)
+            except Exception as e:
+                print(f"[llama-cpp_vlm] VRAM calculation failed: {e}, falling back to -1")
+                n_gpu_layers = -1
 
         if mmproj and mmproj != "None":
             mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
             if chat_handler == "None":
                 raise ValueError('"chat_handler" cannot be None!')
 
-            if vram_limit != -1:
-                mmproj_size = os.path.getsize(mmproj_path) * 1.55 / (1024 ** 3)
-                n_gpu_layers = max(1, int((vram_limit - mmproj_size) / gguf_layer_size))
+            if vram_limit != -1 and n_gpu_layers != -1:
+                mmproj_size = os.path.getsize(mmproj_path) * 1.2 / (1024 ** 3)
+                if vram_limit - mmproj_size <= 0:
+                    print(f"[llama-cpp_vlm] VRAM limit {vram_limit}GB too low for mmproj {mmproj_size:.2f}GB, forcing CPU offload")
+                    n_gpu_layers = 0
+                else:
+                    n_gpu_layers = min(gguf_layers, max(1, int((vram_limit - mmproj_size) / gguf_layer_size)))
 
             print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
             kwargs = {"clip_model_path": mmproj_path, "verbose": False}
@@ -244,8 +269,8 @@ class LLAMA_CPP_STORAGE:
             except Exception as e:
                 raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
         else:
-            if vram_limit != -1:
-                n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
+            if vram_limit != -1 and n_gpu_layers == -1:
+                n_gpu_layers = -1  # 保持 -1，表示全部卸载到 GPU
             if handler is not None:
                 cls.chat_handler = handler(verbose=False)
             else:
@@ -296,12 +321,19 @@ def image2base64(image):
 
 
 def parse_json(json_str):
-    json_output = json_str.strip().removeprefix("```json").removesuffix("```")
+    json_output = json_str.strip()
+    # 移除 markdown 代码块
+    if "```json" in json_output:
+        parts = json_output.split("```json")
+        if len(parts) > 1:
+            json_output = parts[1].split("```")[0]
+    elif "```" in json_output:
+        json_output = json_output.split("```")[1].split("```")[0]
     try:
-        parsed = json.loads(json_output)
+        parsed = json.loads(json_output.strip())
+        return parsed if isinstance(parsed, list) else [parsed]
     except Exception as e:
-        raise ValueError(f"Unable to load JSON data!\n{e}")
-    return parsed
+        raise ValueError(f"Unable to load JSON data!\n{e}\nRaw: {json_str[:300]}")
 
 
 def scale_image(image: torch.Tensor, max_size: int = 128):
@@ -314,21 +346,20 @@ def scale_image(image: torch.Tensor, max_size: int = 128):
     return np.array(img_resized)
 
 
-def qwen3bbox(image, json):
+def qwen3bbox(image, json, coord_scale=1000):
     img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
     bboxes = []
     for item in json:
         x0, y0, x1, y1 = item["bbox_2d"]
-        size = 1000
-        x0 = x0 / size * img.width
-        y0 = y0 / size * img.height
-        x1 = x1 / size * img.width
-        y1 = y1 / size * img.height
+        x0 = x0 / coord_scale * img.width
+        y0 = y0 / coord_scale * img.height
+        x1 = x1 / coord_scale * img.width
+        y1 = y1 / coord_scale * img.height
         bboxes.append((x0, y0, x1, y1))
     return bboxes
 
 
-def draw_bbox(image, json, mode):
+def draw_bbox(image, json, mode, coord_scale=1000):
     label_colors = {}
     img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
     draw = ImageDraw.Draw(img)
@@ -342,11 +373,10 @@ def draw_bbox(image, json, mode):
                 label = "bbox"
         x0, y0, x1, y1 = item["bbox_2d"]
         if mode in ["Qwen3-VL", "Qwen2.5-VL"]:
-            size = 1000
-            x0 = x0 / size * img.width
-            y0 = y0 / size * img.height
-            x1 = x1 / size * img.width
-            y1 = y1 / size * img.height
+            x0 = x0 / coord_scale * img.width
+            y0 = y0 / coord_scale * img.height
+            x1 = x1 / coord_scale * img.width
+            y1 = y1 / coord_scale * img.height
         bbox = (x0, y0, x1, y1)
 
         if label not in label_colors:
@@ -512,16 +542,21 @@ class llama_cpp_instruct_adv:
 
             if inference_mode == "one by one":
                 tmp_list = []
-                image_content = {"type": "image_url", "image_url": {"url": ""}}
-                user_content.append(image_content)
-                messages.append({"role": "user", "content": user_content})
+                # 构建基础 user_content（不含图片）
+                base_user_content = [
+                    {"type": "text", "text": user_content[0]["text"]},
+                    {"type": "image_url", "image_url": {"url": ""}}
+                ]
+                messages.append({"role": "user", "content": base_user_content})
                 print(f"[llama-cpp_vlm] Start processing {len(frames)} images")
 
                 for i, image in enumerate(frames):
                     if mm.processing_interrupted():
                         raise mm.InterruptProcessingException()
                     data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                    for item in user_content:
+                    # 更新当前 user_content 中的图片 URL
+                    current_content = messages[-1]["content"]
+                    for item in current_content:
                         if item.get("type") == "image_url":
                             item["image_url"]["url"] = f"data:image/jpeg;base64,{data}"
                             break
@@ -533,6 +568,10 @@ class llama_cpp_instruct_adv:
                     if len(frames) > 1:
                         tmp_list.append(f"====== Image {i+1} ======")
                     tmp_list.append(text)
+                    # 重置图片 URL 以便下次使用（可选，但留空也没影响）
+                    for item in current_content:
+                        if item.get("type") == "image_url":
+                            item["image_url"]["url"] = ""
                 out1 = "\n\n".join(tmp_list)
             else:
                 for image in frames:
@@ -651,6 +690,7 @@ class json_to_bbox:
                 "json": ("STRING", {"forceInput": True}),
                 "mode": (["simple", "Qwen3-VL", "Qwen2.5-VL"], {"default": "simple"}),
                 "label": ("STRING", {"default": "", "multiline": False}),
+                "coord_scale": ("INT", {"default": 1000, "min": 1, "max": 10000, "step": 1}),
             },
             "optional": {"image": ("IMAGE",)},
         }
@@ -661,9 +701,10 @@ class json_to_bbox:
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
 
-    def process(self, json, mode, label, image=None):
+    def process(self, json, mode, label, coord_scale, image=None):
         mode = mode[0]
         label = label[0]
+        coord_scale = coord_scale[0] if isinstance(coord_scale, list) else coord_scale
         flat_images_list = []
         original_structure = []
         if image is not None:
@@ -690,7 +731,7 @@ class json_to_bbox:
                 curr_idx = i if i < total_images else (total_images - 1)
                 curr_img = flat_images_list[curr_idx]
                 try:
-                    res_img = draw_bbox(curr_img[0], bboxes, mode)
+                    res_img = draw_bbox(curr_img[0], bboxes, mode, coord_scale)
                     if res_img.ndim == 3:
                         res_img = res_img.unsqueeze(0)
                     elif res_img.ndim == 4 and res_img.shape[0] > 1:
@@ -703,7 +744,7 @@ class json_to_bbox:
                 if total_images == 0:
                     raise ValueError("Image required for Qwen mode")
                 curr_idx = i if i < total_images else (total_images - 1)
-                bbox = qwen3bbox(flat_images_list[curr_idx][0], bboxes)
+                bbox = qwen3bbox(flat_images_list[curr_idx][0], bboxes, coord_scale)
             else:
                 bbox = [tuple(item["bbox_2d"]) for item in bboxes]
             output_bboxes.append(bbox)
@@ -1035,7 +1076,7 @@ class PromptEnhancerPreset:
             case "ideogram4":
                 return (ideogram4,)
             case "性感古风":
-                return (性感古风,) 
+                return (性感古风,)
             case _:
                 raise ValueError(f'Unknown preset: "{preset}"')
 
