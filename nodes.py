@@ -29,7 +29,7 @@ try:
 except:
     _MTMD = False
 
-# ========== 精简后的 chat_handlers ==========
+# ========== chat_handlers ==========
 chat_handlers = [
     "None",
     "LLaVA-1.5",
@@ -122,7 +122,6 @@ class LLAMA_CPP_STORAGE:
 
     @classmethod
     def clean(cls, all=False):
-        # 关闭 LLM 实例
         if cls.llm is not None:
             try:
                 cls.llm.close()
@@ -130,7 +129,6 @@ class LLAMA_CPP_STORAGE:
                 pass
             cls.llm = None
 
-        # 安全关闭 chat_handler 的 _exit_stack
         if cls.chat_handler is not None:
             try:
                 if hasattr(cls.chat_handler, '_exit_stack'):
@@ -148,7 +146,6 @@ class LLAMA_CPP_STORAGE:
     @classmethod
     def load_model(cls, config):
         def get_chat_handler(chat_handler):
-            # 兼容旧名称
             if chat_handler in ("Qwen3.5-Thinking", "Qwen3.6-Thinking", "Qwen3.5", "Qwen3.6"):
                 chat_handler = "Qwen3.5/3.6"
             if chat_handler in ("Qwen3-VL-Thinking",):
@@ -234,16 +231,20 @@ class LLAMA_CPP_STORAGE:
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
         handler = get_chat_handler(chat_handler)
 
-        # 计算 GPU 层数（改进版）
         if vram_limit != -1:
             try:
                 gguf_layers = get_layer_count(model_path) or 32
-                # 使用更保守的估算因子 1.2，并防止除以零
                 gguf_size = os.path.getsize(model_path) * 1.2 / (1024 ** 3)
                 gguf_layer_size = max(gguf_size / gguf_layers, 0.05)
             except Exception as e:
                 print(f"[llama-cpp_vlm] VRAM calculation failed: {e}, falling back to -1")
                 n_gpu_layers = -1
+
+        # ========== 构建 Chat Handler 实例 ==========
+        handler_kwargs = {"verbose": False}
+        if _MTMD:
+            handler_kwargs["image_max_tokens"] = image_max_tokens
+            handler_kwargs["image_min_tokens"] = image_min_tokens
 
         if mmproj and mmproj != "None":
             mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
@@ -259,26 +260,34 @@ class LLAMA_CPP_STORAGE:
                     n_gpu_layers = min(gguf_layers, max(1, int((vram_limit - mmproj_size) / gguf_layer_size)))
 
             print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
-            kwargs = {"clip_model_path": mmproj_path, "verbose": False}
-            if _MTMD:
-                kwargs["image_max_tokens"] = image_max_tokens
-                kwargs["image_min_tokens"] = image_min_tokens
-
-            try:
-                cls.chat_handler = handler(**kwargs)
-            except Exception as e:
-                raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
+            handler_kwargs["clip_model_path"] = mmproj_path
         else:
-            if vram_limit != -1 and n_gpu_layers == -1:
-                n_gpu_layers = -1  # 保持 -1，表示全部卸载到 GPU
+            # 纯文本模型，不需要 clip_model_path
+            pass
+
+        # 对于 Qwen3.5/3.6，默认禁用思考（因为 reasoning_budget=0 无效）
+        if chat_handler == "Qwen3.5/3.6":
+            handler_kwargs["enable_thinking"] = False
+            print("[llama-cpp_vlm] Automatically disabling thinking mode for Qwen3.5/3.6 model")
+
+        try:
             if handler is not None:
-                cls.chat_handler = handler(verbose=False)
+                cls.chat_handler = handler(**handler_kwargs)
             else:
                 cls.chat_handler = None
+        except Exception as e:
+            raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
 
         print(f"[llama-cpp_vlm] Loading model: {model}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
-        cls.llm = Llama(model_path, chat_handler=cls.chat_handler, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, verbose=False)
+
+        cls.llm = Llama(
+            model_path,
+            chat_handler=cls.chat_handler,
+            n_gpu_layers=n_gpu_layers,
+            n_ctx=n_ctx,
+            verbose=False
+        )
 
 
 any_type = AnyType("*")
@@ -322,7 +331,6 @@ def image2base64(image):
 
 def parse_json(json_str):
     json_output = json_str.strip()
-    # 移除 markdown 代码块
     if "```json" in json_output:
         parts = json_output.split("```json")
         if len(parts) > 1:
@@ -422,7 +430,7 @@ class llama_cpp_model_loader:
             "n_ctx": n_ctx,
             "vram_limit": vram_limit,
             "image_min_tokens": image_min_tokens,
-            "image_max_tokens": image_max_tokens
+            "image_max_tokens": image_max_tokens,
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
             print("[llama-cpp_vlm] Loading model...")
@@ -479,14 +487,14 @@ class llama_cpp_instruct_adv:
         if parameters is None:
             parameters = {
                 "max_tokens": 1024,
-                "top_k": 30,
-                "top_p": 0.9,
-                "min_p": 0.05,
+                "top_k": 20,
+                "top_p": 0.8,
+                "min_p": 0.00,
                 "typical_p": 1.0,
-                "temperature": 0.8,
+                "temperature": 0.7,
                 "repeat_penalty": 1.0,
                 "frequency_penalty": 0.0,
-                "presence_penalty": 1.0,
+                "presence_penalty": 1.5,
                 "mirostat_mode": 0,
                 "mirostat_eta": 0.1,
                 "mirostat_tau": 5.0,
@@ -542,7 +550,6 @@ class llama_cpp_instruct_adv:
 
             if inference_mode == "one by one":
                 tmp_list = []
-                # 构建基础 user_content（不含图片）
                 base_user_content = [
                     {"type": "text", "text": user_content[0]["text"]},
                     {"type": "image_url", "image_url": {"url": ""}}
@@ -554,21 +561,20 @@ class llama_cpp_instruct_adv:
                     if mm.processing_interrupted():
                         raise mm.InterruptProcessingException()
                     data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                    # 更新当前 user_content 中的图片 URL
                     current_content = messages[-1]["content"]
                     for item in current_content:
                         if item.get("type") == "image_url":
                             item["image_url"]["url"] = f"data:image/jpeg;base64,{data}"
                             break
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                        messages=messages, seed=seed, reasoning_budget=reasoning_budget, **_parameters
+                        messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                        **_parameters
                     )
                     text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
                     out2.append(text)
                     if len(frames) > 1:
                         tmp_list.append(f"====== Image {i+1} ======")
                     tmp_list.append(text)
-                    # 重置图片 URL 以便下次使用（可选，但留空也没影响）
                     for item in current_content:
                         if item.get("type") == "image_url":
                             item["image_url"]["url"] = ""
@@ -582,14 +588,16 @@ class llama_cpp_instruct_adv:
                     user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
                 messages.append({"role": "user", "content": user_content})
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                    messages=messages, seed=seed, reasoning_budget=reasoning_budget, **_parameters
+                    messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                    **_parameters
                 )
                 out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
                 out2 = [out1]
         else:
             messages.append({"role": "user", "content": user_content})
             output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                messages=messages, seed=seed, reasoning_budget=reasoning_budget, **_parameters
+                messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                **_parameters
             )
             out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
             out2 = [out1]
