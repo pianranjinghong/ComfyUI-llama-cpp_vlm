@@ -229,9 +229,26 @@ class LLAMA_CPP_STORAGE:
         n_gpu_layers = -1
 
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
-        handler = get_chat_handler(chat_handler)
 
-        if vram_limit != -1:
+        # ========== 智能处理 chat_handler 与 mmproj 的关系 ==========
+        if mmproj in (None, "None"):
+            if chat_handler != "None":
+                print(f"[llama-cpp_vlm] WARNING: mmproj is not provided, but chat_handler='{chat_handler}' is specified.")
+                print(f"[llama-cpp_vlm] Forcing chat_handler to 'None' to use GGUF built-in chat template.")
+                chat_handler = "None"
+            handler = None
+            handler_kwargs = {}
+        else:
+            if chat_handler == "None":
+                raise ValueError(f"mmproj '{mmproj}' requires a non-None chat_handler (e.g., Qwen2.5-VL, LLaVA-1.5, etc.).")
+            handler = get_chat_handler(chat_handler)
+            handler_kwargs = {"verbose": False}
+            if _MTMD:
+                handler_kwargs["image_max_tokens"] = image_max_tokens
+                handler_kwargs["image_min_tokens"] = image_min_tokens
+
+        # VRAM 计算（仅多模态时需要）
+        if vram_limit != -1 and mmproj not in (None, "None"):
             try:
                 gguf_layers = get_layer_count(model_path) or 32
                 gguf_size = os.path.getsize(model_path) * 1.2 / (1024 ** 3)
@@ -240,17 +257,9 @@ class LLAMA_CPP_STORAGE:
                 print(f"[llama-cpp_vlm] VRAM calculation failed: {e}, falling back to -1")
                 n_gpu_layers = -1
 
-        # ========== 构建 Chat Handler 实例 ==========
-        handler_kwargs = {"verbose": False}
-        if _MTMD:
-            handler_kwargs["image_max_tokens"] = image_max_tokens
-            handler_kwargs["image_min_tokens"] = image_min_tokens
-
-        if mmproj and mmproj != "None":
+        # 加载 mmproj（多模态模型）
+        if mmproj not in (None, "None"):
             mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
-            if chat_handler == "None":
-                raise ValueError('"chat_handler" cannot be None!')
-
             if vram_limit != -1 and n_gpu_layers != -1:
                 mmproj_size = os.path.getsize(mmproj_path) * 1.2 / (1024 ** 3)
                 if vram_limit - mmproj_size <= 0:
@@ -258,25 +267,36 @@ class LLAMA_CPP_STORAGE:
                     n_gpu_layers = 0
                 else:
                     n_gpu_layers = min(gguf_layers, max(1, int((vram_limit - mmproj_size) / gguf_layer_size)))
-
             print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
             handler_kwargs["clip_model_path"] = mmproj_path
         else:
-            # 纯文本模型，不需要 clip_model_path
+            # 纯文本模型：无需 mmproj 路径
             pass
 
-        # 对于 Qwen3.5/3.6，默认禁用思考（因为 reasoning_budget=0 无效）
-        if chat_handler == "Qwen3.5/3.6":
-            handler_kwargs["enable_thinking"] = False
-            print("[llama-cpp_vlm] Automatically disabling thinking mode for Qwen3.5/3.6 model")
+        # 基于 chat_handler 或模型文件名检测
+        is_qwen = False
+        # 首先检查 chat_handler 是否包含 "Qwen"
+        if "qwen" in chat_handler.lower():
+            is_qwen = True
+        # 其次检查模型文件名（不区分大小写）
+        elif "qwen" in model.lower():
+            is_qwen = True
 
-        try:
-            if handler is not None:
+        chat_template_kwargs = {}
+        if is_qwen:
+            chat_template_kwargs["enable_thinking"] = False
+            print("[llama-cpp_vlm] Qwen model detected, automatically disabling thinking via chat_template_kwargs.")
+
+
+        # 实例化 chat_handler（只有多模态模型需要）
+        if handler is not None:
+            try:
                 cls.chat_handler = handler(**handler_kwargs)
-            else:
-                cls.chat_handler = None
-        except Exception as e:
-            raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
+            except Exception as e:
+                raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
+        else:
+            cls.chat_handler = None
+            print("[llama-cpp_vlm] Pure text model: chat_handler set to None. Will use GGUF built-in chat template if available.")
 
         print(f"[llama-cpp_vlm] Loading model: {model}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
@@ -286,6 +306,7 @@ class LLAMA_CPP_STORAGE:
             chat_handler=cls.chat_handler,
             n_gpu_layers=n_gpu_layers,
             n_ctx=n_ctx,
+            chat_template_kwargs={"enable_thinking": False}, 
             verbose=False
         )
 
@@ -304,21 +325,161 @@ if not hasattr(mm, "unload_all_models_backup"):
 llm_extensions = ['.ckpt', '.pt', '.bin', '.pth', '.safetensors', '.gguf']
 folder_paths.folder_names_and_paths["LLM"] = ([os.path.join(folder_paths.models_dir, "LLM")], llm_extensions)
 
+# ========== 图像/视频反推预设提示词（已迁移至 .format 风格 + 命名占位符） ==========
 preset_prompts = {
     "Empty - Nothing": "",
-    "Normal - Describe": "Describe this @.",
-    "Prompt Style - Tags": "Your task is to generate a clean list of comma-separated tags for a text-to-@ AI, based *only* on the visual information in the @. Limit the output to a maximum of 50 unique tags. Strictly describe visual elements like subject, clothing, environment, colors, lighting, and composition. Do not include abstract concepts, interpretations, marketing terms, or technical jargon (e.g., no 'SEO', 'brand-aligned', 'viral potential'). The goal is a concise list of visual descriptors. Avoid repeating tags.",
-    "Prompt Style - Simple": "Analyze the @ and generate a simple, single-sentence text-to-@ prompt. Describe the main subject and the setting concisely.",
-    "Prompt Style - Detailed": "Generate a detailed, artistic text-to-@ prompt based on the @. Combine the subject, their actions, the environment, lighting, and overall mood into a single, cohesive paragraph of about 2-3 sentences. Focus on key visual details.",
-    "Prompt Style - Extreme Detailed": "Generate an extremely detailed and descriptive text-to-@ prompt from the @. Create a rich paragraph that elaborates on the subject's appearance, textures of clothing, specific background elements, the quality and color of light, shadows, and the overall atmosphere. Aim for a highly descriptive and immersive prompt.",
-    "Prompt Style - Cinematic": "Act as a master prompt engineer. Create a highly detailed and evocative prompt for an @ generation AI. Describe the subject, their pose, the environment, the lighting, the mood, and the artistic style (e.g., photorealistic, cinematic, painterly). Weave all elements into a single, natural language paragraph, focusing on visual impact.",
-    "Creative - Detailed Analysis": "Describe this @ in detail, breaking down the subject, attire, accessories, background, and composition into separate sections.",
+    "Normal - Describe": "Describe this {media_type}.",
+    "Prompt Style - Tags": (
+        "Your task is to generate a clean list of comma-separated tags for a text-to-{media_type} AI, based *only* on the visual information in the {media_type}. "
+        "Limit the output to a maximum of 50 unique tags. Strictly describe visual elements like subject, clothing, environment, colors, lighting, and composition. "
+        "Do not include abstract concepts, interpretations, marketing terms, or technical jargon (e.g., no 'SEO', 'brand-aligned', 'viral potential'). "
+        "The goal is a concise list of visual descriptors. Avoid repeating tags."
+    ),
+    "Prompt Style - Simple": "Analyze the {media_type} and generate a simple, single-sentence text-to-{media_type} prompt. Describe the main subject and the setting concisely.",
+    "Prompt Style - Detailed": "Generate a detailed, artistic text-to-{media_type} prompt based on the {media_type}. Combine the subject, their actions, the environment, lighting, and overall mood into a single, cohesive paragraph of about 2-3 sentences. Focus on key visual details.",
+    "Prompt Style - Extreme Detailed": "Generate an extremely detailed and descriptive text-to-{media_type} prompt from the {media_type}. Create a rich paragraph that elaborates on the subject's appearance, textures of clothing, specific background elements, the quality and color of light, shadows, and the overall atmosphere. Aim for a highly descriptive and immersive prompt.",
+    "Prompt Style - Cinematic": "Act as a master prompt engineer. Create a highly detailed and evocative prompt for an {media_type} generation AI. Describe the subject, their pose, the environment, the lighting, the mood, and the artistic style (e.g., photorealistic, cinematic, painterly). Weave all elements into a single, natural language paragraph, focusing on visual impact.",
+    "Creative - Detailed Analysis": "Describe this {media_type} in detail, breaking down the subject, attire, accessories, background, and composition into separate sections.",
     "Creative - Summarize Video": "Summarize the key events and narrative points in this video.",
-    "Creative - Short Story": "Write a short, imaginative story inspired by this @ or video.",
-    "Creative - Refine & Expand Prompt": "Refine and enhance the following user prompt for creative text-to-@ generation. Keep the meaning and keywords, make it more expressive and visually rich. Output **only the improved prompt text itself**, without any reasoning steps, thinking process, or additional commentary.",
-    "Vision - *Bounding Box": 'Locate every instance that belongs to the following categories: "#". Report bbox coordinates in {"bbox_2d": [x1, y1, x2, y2], "label": "string"} JSON format as a List.'
+    "Creative - Short Story": "Write a short, imaginative story inspired by this {media_type}.",
+    "Creative - Refine & Expand Prompt": (
+        "Refine and enhance the following user prompt for creative text-to-{media_type} generation. "
+        "Keep the meaning and keywords, make it more expressive and visually rich. "
+        "Output **only the improved prompt text itself**, without any reasoning steps, thinking process, or additional commentary.\n\n"
+        "User input: <input>{input}</input>"
+    ),
+    "Vision - *Bounding Box": (
+        'Locate every instance that belongs to the following categories: "{input}". '
+        'Report bbox coordinates in {{"bbox_2d": [x1, y1, x2, y2], "label": "string"}} JSON format as a List.'
+    )
 }
 preset_tags = list(preset_prompts.keys())
+
+# ========== 纯文本扩写预设提示词（使用命名占位符 + XML 标签包裹输入） ==========
+text_preset_prompts = {
+    "Empty - Nothing": "",
+
+    "扩写-领域自适应": (
+        "Role\n你是一位拥有全学科视觉知识的图像生成提示词专家。你的核心能力是：精准识别用户输入关键词的侧重点，自动判定其所属领域（如写实摄影、工业设计、平面海报、二次元动漫、3D动画、数字艺术等），并调用该领域的专业术语进行像素级的深度扩写。\n\n"
+        "最高指令 (Absolute Command)\n\n"
+        "1.语言自适应：识别用户输入语言。用户用中文提问，你输出中文指令；用户用英文提问，你输出英文指令。\n"
+        "2.格式绝对纯净：严禁输出 Markdown 符号（如星号、井号）、严禁中英对照括号、严禁输出任何解释或前缀。\n"
+        "3.领域自适应：必须先判断输入内容的领域属性，严禁跨领域混用术语（例如：严禁在平面设计类提示词中加入焦距参数，严禁在二次元插画中加入皮肤毛孔描写）。\n"
+        "4.语义忠实：严格保留用户所有原始关键词，严禁擅自增删核心主体。\n"
+        "5.拒绝抽象词汇：禁止使用高质量、精美等模糊词，必须转化为可感知的物理细节或专业艺术术语。\n\n"
+        "核心逻辑 (领域判定与定向扩写)\n\n"
+        "第一步：领域侧重点判定 (Domain Recognition)\n"
+        "分析用户关键词，自动进入以下对应的专业模式：\n"
+        "A. 摄影模式 (Photography)：侧重镜头焦段、光圈、胶片质感、真实皮肤/环境肌理。\n"
+        "B. 工业/产品模式 (Product)：侧重材质工艺（CNC、阳极氧化）、商业布光（轮廓光）、结构精密感。\n"
+        "C. 平面/海报模式 (Graphic Design)：侧重构图布局、负空间、排版占位感、矢量色彩。\n"
+        "D. 二次元/漫画模式 (Anime/Manga)：侧重线条精细度（Line art）、赛璐璐阴影（Cel shading）、网点纸（Screen tones）、夸张的眼神细节、特定的画风特征。\n"
+        "E. 3D动画/CGI模式 (3D Animation)：侧重次表面散射（SSS材质）、角色建模精度、电影级3D布光、渲染器风格（Pixar/Dreamworks风格）。\n"
+        "F. 艺术/插画模式 (Art/Illustration)：侧重笔触质感、媒介（水墨、油画、水彩）、流派特征。\n\n"
+        "第二步：专业维度填充 (Directional Supplement)\n"
+        "主体与质感：动漫类强调线稿与填色；3D类强调建模与光影反弹；产品类强调加工工艺。\n"
+        "环境与背景：根据模式补充细节。摄影类补自然环境；3D类补置景；插画类补意境或笔触背景。\n"
+        "专业技术参数：匹配该领域最专业的后缀（如摄影的 35mm，3D类的 Octane render，二次元的 Cel shaded）。\n\n"
+        "输出规范\n\n"
+        "结构顺序：深度扩写的专业描述, [领域特定参数], 照片级写实的(针对写实类) 或 风格化的(针对非写实类), 高保真，超精细纹理，8K分辨率\n\n"
+        "Input to expand: <input>{input}</input>"
+    ),
+     "扩写-自然语言": (
+        "你是一位专业的AI绘画提示词工程师，擅长将简短描述转化为高质量、细节丰富的提示词。请按照以下步骤处理用户输入：\n\n"
+        "1. 分析理解：\n"
+        "   - 识别用户输入的核心主题和关键元素\n"
+        "   - 确定画面类型（人物、风景、静物、概念艺术等）\n"
+        "   - 提取已有的视觉细节、风格倾向和情感基调\n\n"
+        "2. 结构化扩展：\n"
+        "   - 主体描述：补充主体的详细特征（如人物的外貌、表情、服装、姿态；物体的材质、形状、纹理等）\n"
+        "   - 场景环境：根据主题补充或完善场景信息（室内/室外、自然/城市、时代背景等）\n"
+        "   - 构图视角：添加画面构图信息（视角高度、景别大小、主体位置、前景/背景关系等）\n"
+        "   - 光影氛围：补充光源类型、光线方向、明暗对比、色调氛围等\n"
+        "   - 风格化：根据内容补充适合的艺术风格、渲染技术或参考艺术家\n"
+        "   - 质量标签：添加提升画面品质的技术描述（高细节、高分辨率、写实渲染等）\n\n"
+        "3. 智能补全：\n"
+        "   - 当用户输入缺少关键元素时，基于主题自动补充合理的场景、光源、环境氛围等\n"
+        "   - 确保补充内容与主题风格协调一致，不产生冲突元素\n"
+        "   - 保持原始意图的同时，丰富画面的叙事性和视觉层次\n\n"
+        "4. 输出格式：\n"
+        "   - 使用自然流畅的语言描述，避免机械堆砌关键词\n"
+        "   - 按照视觉重要性排序元素，主体描述在前，环境氛围在后\n"
+        "   - 直接输出完整提示词，不添加解释、分类标签或注释\n"
+        "   - 控制提示词长度在适当范围内，确保核心元素突出\n\n"
+        "请直接返回扩展后的完整提示词，不需要解释你的思考过程或添加额外说明。\n\n"
+        "Input to expand: <input>{input}</input>"
+    ),
+
+    "扩写-Tag": (
+        "你是一位专业的AI绘画提示词工程师，擅长将简短描述转化为高质量、细节丰富的提示词。请按照以下步骤处理用户输入：\n\n"
+        "1. 分析理解：\n"
+        "   - 识别用户输入的核心主题和关键元素\n"
+        "   - 确定画面类型（人物、风景、静物、概念艺术等）\n"
+        "   - 提取已有的视觉细节、风格倾向和情感基调\n\n"
+        "2. 结构化扩展：\n"
+        "   - 主体描述：补充主体的详细特征（如人物的外貌、表情、服装、姿态；物体的材质、形状、纹理等）\n"
+        "   - 场景环境：根据主题补充或完善场景信息（室内/室外、自然/城市、时代背景等）\n"
+        "   - 构图视角：添加画面构图信息（视角高度、景别大小、主体位置、前景/背景关系等）\n"
+        "   - 光影氛围：补充光源类型、光线方向、明暗对比、色调氛围等\n"
+        "   - 风格化：根据内容补充适合的艺术风格、渲染技术或参考艺术家\n"
+        "   - 质量标签：添加提升画面品质的技术描述（高细节、高分辨率、写实渲染等）\n\n"
+        "3. 智能补全：\n"
+        "   - 当用户输入缺少关键元素时，基于主题自动补充合理的场景、光源、环境氛围等\n"
+        "   - 确保补充内容与主题风格协调一致，不产生冲突元素\n"
+        "   - 保持原始意图的同时，丰富画面的叙事性和视觉层次\n\n"
+        "4. 输出格式：\n"
+        "   - 直接输出标签，不添加任何分类或说明\n"
+        "   - 按照视觉重要性排序元素，主体描述在前，环境氛围在后\n"
+        "   - 控制提示词长度在适当范围内，确保核心元素突出\n\n"
+        "请直接返回扩展后的完整提示词，不需要解释你的思考过程或添加额外说明。\n\n"
+        "Input to expand: <input>{input}</input>"
+    ),
+
+    "Refine & Expand Prompt": (
+        "You are an expert prompt engineer. Your task is to refine and expand the user's creative text into a highly expressive, vivid, and detailed prompt. "
+        "Add sensory details, emotional tones, and rich vocabulary while preserving the original meaning and keywords. "
+        "The output should be a single, flowing paragraph of 80–150 words that feels immersive and compelling. "
+        "CRITICAL: Output ONLY the final refined prompt. Do not include any reasoning, thinking process, extra commentary, or markdown formatting.\n\n"
+        "User input: <input>{input}</input>"
+    ),
+
+    "Expand Prompt for Image Generation": (
+        "You are a master prompt engineer specializing in text-to-image generation. "
+        "Your task is to expand the short user prompt into a **comprehensive, highly detailed, and visually rich image prompt** that can produce a perfect, high-quality image. "
+        "Incorporate the following elements seamlessly into a single, natural language paragraph (100–200 words):\n"
+        "- **Main subject(s):** Physical appearance, clothing, pose, expression, age, ethnicity, distinctive features.\n"
+        "- **Environment & background:** Specific location (e.g., \"ancient forest at twilight\", \"cyberpunk alley after rain\"), depth cues, foreground/midground/background details.\n"
+        "- **Lighting & atmosphere:** Light source (e.g., \"golden hour sunlight\", \"neon glow\", \"soft window light\"), shadows, mood (e.g., \"mysterious\", \"joyful\", \"melancholic\"), weather or time of day.\n"
+        "- **Color & texture:** Dominant colors, color harmony (e.g., \"complementary blues and oranges\"), surface textures (e.g., \"rusty metal\", \"velvet\", \"glossy ceramic\").\n"
+        "- **Composition & camera:** Camera angle (e.g., \"low angle\", \"eye-level\", \"bird's-eye view\"), shot type (e.g., \"close-up\", \"wide shot\", \"medium shot\"), depth of field (e.g., \"shallow depth of field with creamy bokeh\").\n"
+        "- **Style & artistic direction:** Artistic style (e.g., \"photorealistic\", \"oil painting\", \"anime\", \"cinematic\"), quality modifiers (e.g., \"8K\", \"intricate details\", \"sharp focus\").\n\n"
+        "CRITICAL RULES:\n"
+        "- Output ONLY the final expanded prompt. No explanations, no reasoning, no extra text.\n"
+        "- Write as a single, continuous paragraph—no bullet points, no line breaks inside the prompt.\n"
+        "- Be specific and concrete. Use adjectives, but avoid clichés.\n"
+        "- Do NOT repeat the original short prompt verbatim; integrate it naturally.\n\n"
+        "Short prompt: <input>{input}</input>"
+    ),
+
+    "Expand Prompt for Video Generation": (
+        "You are an expert prompt engineer for text-to-video AI models (e.g., Sora, Runway Gen-3, Pika Labs). "
+        "Your task is to expand a short user prompt into a **detailed, temporally coherent, and visually dynamic video prompt** (150–250 words). "
+        "The final prompt will be used to generate a short video clip. Include the following aspects in a single, flowing paragraph:\n"
+        "- **Subject & action:** Clear description of main subjects, their movements, interactions, and temporal changes (e.g., \"a woman walks slowly, her hair blowing in the wind\", \"a car drifts around a corner, tires smoking\").\n"
+        "- **Camera motion:** Specific camera movement (e.g., \"slow push-in\", \"crane shot rising\", \"handheld follow\", \"tracking shot from left to right\").\n"
+        "- **Scene & environment transitions:** If applicable, describe any changes over time (e.g., \"time-lapse of clouds moving\", \"day to night transition\").\n"
+        "- **Lighting dynamics:** How lighting evolves (e.g., \"sunset light gradually fades, replaced by neon signs turning on\").\n"
+        "- **Mood & pacing:** Emotional tone (e.g., \"tense and hurried\", \"serene and slow\"), rhythm of cuts or scene changes.\n"
+        "- **Visual consistency:** Ensure colors, style, and subject appearance remain stable across frames unless intentionally changing.\n\n"
+        "CRITICAL RULES:\n"
+        "- Output ONLY the final expanded prompt. No meta commentary, no reasoning.\n"
+        "- Use present tense, active voice. Write as a single paragraph.\n"
+        "- Do NOT include timestamps or frame numbers—describe natural flow.\n"
+        "- Emphasize motion and temporal evolution, not just a static scene.\n\n"
+        "Short prompt: <input>{input}</input>"
+    ),
+}
+text_preset_tags = list(text_preset_prompts.keys())
 
 
 def image2base64(image):
@@ -439,6 +600,7 @@ class llama_cpp_model_loader:
 
 
 class llama_cpp_instruct_adv:
+    """图片/视频反推节点（已升级为 .format + 命名占位符，并兼容自动聊天模板）"""
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -484,17 +646,18 @@ class llama_cpp_instruct_adv:
         if not LLAMA_CPP_STORAGE.llm:
             LLAMA_CPP_STORAGE.load_model(llama_model)
 
+        # 图片/视频反推专用默认参数（在遵循原图的基础上增加适度创意）
         if parameters is None:
             parameters = {
                 "max_tokens": 1024,
-                "top_k": 20,
-                "top_p": 0.8,
-                "min_p": 0.00,
+                "top_k": 40,
+                "top_p": 0.92,
+                "min_p": 0.05,
                 "typical_p": 1.0,
-                "temperature": 0.7,
-                "repeat_penalty": 1.0,
-                "frequency_penalty": 0.0,
-                "presence_penalty": 1.5,
+                "temperature": 0.75,
+                "repeat_penalty": 1.1,
+                "frequency_penalty": 0.2,
+                "presence_penalty": 0.3,
                 "mirostat_mode": 0,
                 "mirostat_eta": 0.1,
                 "mirostat_tau": 5.0,
@@ -536,10 +699,35 @@ class llama_cpp_instruct_adv:
         if custom_prompt.strip() and "*" not in preset_prompt:
             user_content.append({"type": "text", "text": custom_prompt})
         else:
-            p = preset_prompts[preset_prompt].replace("#", custom_prompt.strip()).replace("@", "video" if video_input else "image")
+            template = preset_prompts[preset_prompt]
+            media_type = "video" if video_input else "image"
+            try:
+                p = template.format(input=custom_prompt.strip(), media_type=media_type)
+            except KeyError as e:
+                missing = e.args[0]
+                print(f"[WARN] Preset '{preset_prompt}' missing placeholder {{{missing}}}. Appending input.")
+                p = f"{template}\n\n{missing.capitalize()}: {custom_prompt.strip()}"
             user_content.append({"type": "text", "text": p})
 
-        if images is not None:
+        # 判断是否有图像输入
+        has_images = images is not None and (
+            (isinstance(images, torch.Tensor) and images.numel() > 0) or
+            (isinstance(images, list) and len(images) > 0)
+        )
+
+        if not has_images:
+            # 纯文本场景：将 user_content 从列表转换为纯字符串，以兼容自动聊天模板
+            if user_content and isinstance(user_content, list) and len(user_content) == 1 and user_content[0]["type"] == "text":
+                user_content = user_content[0]["text"]
+            messages.append({"role": "user", "content": user_content})
+            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
+                messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                **_parameters
+            )
+            out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+            out2 = [out1]
+        else:
+            # 有图像输入：必须使用多模态 chat_handler，content 保持列表格式
             if not hasattr(LLAMA_CPP_STORAGE.chat_handler, "clip_model_path") or LLAMA_CPP_STORAGE.chat_handler.clip_model_path is None:
                 raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
 
@@ -593,14 +781,6 @@ class llama_cpp_instruct_adv:
                 )
                 out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
                 out2 = [out1]
-        else:
-            messages.append({"role": "user", "content": user_content})
-            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                messages=messages, seed=seed, reasoning_budget=reasoning_budget,
-                **_parameters
-            )
-            out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-            out2 = [out1]
 
         if save_states:
             print(f"[llama-cpp_vlm] Saving state id={uid}...")
@@ -619,20 +799,137 @@ class llama_cpp_instruct_adv:
         return (out1, out2, uid)
 
 
+class llama_cpp_text_enhancer:
+    """纯文本扩写/润色节点，使用 .format + XML 标签包裹输入，强制禁用思考模式，并采用高创意默认参数"""
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llama_model": ("LLAMACPPMODEL",),
+                "preset_prompt": (text_preset_tags, {"default": text_preset_tags[1]}),
+                "custom_prompt": ("STRING", {"default": "", "multiline": True}),
+                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "force_offload": ("BOOLEAN", {"default": False}),
+                "save_states": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+            "optional": {
+                "parameters": ("LLAMACPPARAMS",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "process"
+    CATEGORY = "llama-cpp-vlm"
+
+    def sanitize_messages(self, messages):
+        return messages.copy()
+
+    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt,
+                seed, force_offload, save_states, unique_id,
+                parameters=None):
+        if not LLAMA_CPP_STORAGE.llm:
+            LLAMA_CPP_STORAGE.load_model(llama_model)
+
+        # 纯文本扩写专用默认参数（充分发挥创意，同时遵循原意）
+        if parameters is None:
+            parameters = {
+                "max_tokens": 1024,
+                "top_k": 60,
+                "top_p": 0.96,
+                "min_p": 0.08,
+                "typical_p": 1.0,
+                "temperature": 0.88,
+                "repeat_penalty": 1.15,
+                "frequency_penalty": 0.25,
+                "presence_penalty": 0.4,
+                "mirostat_mode": 0,
+                "mirostat_eta": 0.1,
+                "mirostat_tau": 5.0,
+                "reasoning_budget": 0,
+            }
+
+        if _MTMD:
+            parameters.pop("presence_penalty", None)
+
+        _uid = parameters.get("state_uid", None)
+        _parameters = parameters.copy()
+        _parameters.pop("state_uid", None)
+        # 强制禁用思考模式
+        _parameters["reasoning_budget"] = 0
+
+        uid = unique_id.rpartition('.')[-1] if _uid in (None, -1) else _uid
+
+        last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
+        if last_sys_prompt != system_prompt:
+            messages = []
+            LLAMA_CPP_STORAGE.clean_state()
+            LLAMA_CPP_STORAGE.sys_prompts[f"{uid}"] = system_prompt
+            if system_prompt.strip():
+                messages.append({"role": "system", "content": system_prompt})
+        else:
+            if save_states:
+                try:
+                    print(f"[llama-cpp_vlm] Loading text state id={uid}...")
+                    messages = LLAMA_CPP_STORAGE.messages.get(f"{uid}", [])
+                except Exception:
+                    messages = []
+            else:
+                messages = []
+
+        # 构建用户消息（纯文本，必须为字符串）
+        if preset_prompt == "Empty - Nothing":
+            user_content = custom_prompt.strip()
+        else:
+            template = text_preset_prompts[preset_prompt]
+            try:
+                user_content = template.format(input=custom_prompt.strip())
+            except KeyError:
+                # 兜底：如果模板缺少 {input} 占位符，则直接拼接
+                print(f"[WARN] Preset '{preset_prompt}' missing '{{input}}' placeholder. Appending input.")
+                user_content = f"{template}\n\nInput: <input>{custom_prompt.strip()}</input>"
+
+        messages.append({"role": "user", "content": user_content})
+
+        # 调用模型（纯文本模式）
+        output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
+            messages=messages, seed=seed, **_parameters
+        )
+        out_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+
+        if save_states:
+            print(f"[llama-cpp_vlm] Saving text state id={uid}...")
+            messages.append({"role": "assistant", "content": out_text})
+            clear_message = self.sanitize_messages(messages)
+            LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
+        else:
+            if not LLAMA_CPP_STORAGE.messages.get(f"{uid}"):
+                LLAMA_CPP_STORAGE.sys_prompts.pop(f"{uid}", None)
+
+        if force_offload:
+            LLAMA_CPP_STORAGE.clean()
+
+        del messages
+        gc.collect()
+        return (out_text,)
+
+
 class llama_cpp_parameters:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 1}),
-                "top_k": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 1000, "step": 1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "presence_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2, "step": 1}),
                 "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01}),
@@ -1015,7 +1312,7 @@ class PromptEnhancerPreset:
                             "Flux.2 T2I", "Flux.2 I2I", "Wan T2V [EN]", "Wan T2V [ZH]", "Wan I2V [EN]", "Wan I2V [ZH]",
                             "Wan I2V Full-Auto [EN]", "Wan I2V Full-Auto [ZH]", "Wan FLF2V [EN]", "Wan FLF2V [ZH]",
                             "喵呜图片精细反推", "扩写_人像大师", "扩写_Tags风格", "图像描述_Tag风格", "像素级描述_阿丹",
-                            "黑兽", "图像编辑重绘_CJL", "图像到视频提示词_CJL", "全图反推_中文", "WAN分镜规则","ideogram4","性感古风"],)
+                            "黑兽", "图像编辑重绘_CJL", "图像到视频提示词_CJL", "全图反推_中文", "WAN分镜规则","ideogram4","性感古风", "Z_Engineer", "中文文生图"],)
             }
         }
     RETURN_TYPES = ("STRING",)
@@ -1085,6 +1382,10 @@ class PromptEnhancerPreset:
                 return (ideogram4,)
             case "性感古风":
                 return (性感古风,)
+            case "Z_Engineer":
+                return (Z_Engineer,)
+            case "中文文生图":
+                return (中文文生图,)
             case _:
                 raise ValueError(f'Unknown preset: "{preset}"')
 
@@ -1092,6 +1393,7 @@ class PromptEnhancerPreset:
 NODE_CLASS_MAPPINGS = {
     "llama_cpp_model_loader": llama_cpp_model_loader,
     "llama_cpp_instruct_adv": llama_cpp_instruct_adv,
+    "llama_cpp_text_enhancer": llama_cpp_text_enhancer,
     "llama_cpp_parameters": llama_cpp_parameters,
     "llama_cpp_unload_model": llama_cpp_unload_model,
     "llama_cpp_clean_states": llama_cpp_clean_states,
@@ -1106,7 +1408,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_model_loader": "Llama-cpp Model Loader",
-    "llama_cpp_instruct_adv": "Llama-cpp Instruct",
+    "llama_cpp_instruct_adv": "Llama-cpp Instruct (Image/Video)",
+    "llama_cpp_text_enhancer": "Llama-cpp Text Enhancer (Pure Text)",
     "llama_cpp_parameters": "Llama-cpp Parameters",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
     "llama_cpp_clean_states": "Llama-cpp Clean States",
