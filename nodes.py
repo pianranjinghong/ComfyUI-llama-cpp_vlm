@@ -4,7 +4,11 @@ import gc
 import json
 import base64
 import random
+import tempfile
+import subprocess
+import re
 import torch
+import inspect
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -18,85 +22,33 @@ import comfy.model_management as mm
 import comfy.utils
 
 from llama_cpp import Llama
-from llama_cpp.llama_chat_format import (
-    Llava15ChatHandler, Llava16ChatHandler, MoondreamChatHandler,
-    NanoLlavaChatHandler, Llama3VisionAlphaChatHandler, MiniCPMv26ChatHandler
-)
+# 导入多模态模块
+import llama_cpp.llama_multimodal as mtmd_module
+from llama_cpp.llama_multimodal import GenericMTMDChatHandler, MTMDChatHandler
 
+# ---------- 增加 llama_backend_free 的尝试导入 ----------
 try:
-    from llama_cpp.llama_chat_format import MTMDChatHandler
-    _MTMD = True
-except:
-    _MTMD = False
+    from llama_cpp import llama_backend_free
+except ImportError:
+    llama_backend_free = None
 
-# ========== chat_handlers ==========
-chat_handlers = [
-    "None",
-    "LLaVA-1.5",
-    "LLaVA-1.6",
-    "Moondream2",
-    "nanoLLaVA",
-    "llama3-Vision-Alpha",
-    "MiniCPM-v2.6",
-    "MiniCPM-v4.5",
-    "Gemma3",
-    "Gemma4",
-    "Qwen2.5-VL",
-    "Qwen3-VL",
-    "Qwen3.5/3.6",
-    "GLM-4.6V",
-    "GLM-4.1V",
-    "LFM2-VL",
-    "LFM2.5-VL",
-    "Granite-Docling"
-]
+# ========== 动态获取所有内置 MTMDChatHandler 子类 ==========
+handler_class_map = {}
+for attr_name in dir(mtmd_module):
+    attr = getattr(mtmd_module, attr_name)
+    if isinstance(attr, type) and issubclass(attr, MTMDChatHandler) and attr is not MTMDChatHandler:
+        handler_class_map[attr.__name__] = attr
 
-# 导入各个 ChatHandler
-try:
-    from llama_cpp.llama_chat_format import Gemma3ChatHandler
-except:
-    Gemma3ChatHandler = None
+BUILTIN_CHAT_FORMATS = sorted([name for name in handler_class_map.keys() if name != "GenericMTMDChatHandler"])
 
-try:
-    from llama_cpp.llama_chat_format import Gemma4ChatHandler
-except:
-    Gemma4ChatHandler = None
+# 获取节点同级目录下的 jinja 文件夹
+NODE_DIR = os.path.dirname(os.path.abspath(__file__))
+JINJA_DIR = os.path.join(NODE_DIR, "jinja")
+os.makedirs(JINJA_DIR, exist_ok=True)
+jinja_files = [f for f in os.listdir(JINJA_DIR) if f.endswith('.jinja')]
+JINJA_FILE_LIST = ["None"] + jinja_files
 
-try:
-    from llama_cpp.llama_chat_format import Qwen25VLChatHandler
-except:
-    Qwen25VLChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import Qwen3VLChatHandler
-except:
-    Qwen3VLChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import Qwen35ChatHandler
-except:
-    Qwen35ChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import GLM46VChatHandler, GLM41VChatHandler
-except:
-    GLM46VChatHandler = None
-    GLM41VChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import LFM2VLChatHandler
-except:
-    LFM2VLChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import LFM25VLChatHandler
-except:
-    LFM25VLChatHandler = None
-
-try:
-    from llama_cpp.llama_chat_format import GraniteDoclingChatHandler
-except:
-    GraniteDoclingChatHandler = None
+chat_handlers = ["None", "Generic MTMD"] + BUILTIN_CHAT_FORMATS
 
 
 class AnyType(str):
@@ -108,207 +60,236 @@ class LLAMA_CPP_STORAGE:
     llm = None
     chat_handler = None
     current_config = None
-    messages = {}
-    sys_prompts = {}
 
     @classmethod
-    def clean_state(cls, id=-1):
-        if id == -1:
-            cls.messages.clear()
-            cls.sys_prompts.clear()
-        else:
-            cls.messages.pop(f"{id}", None)
-            cls.sys_prompts.pop(f"{id}", None)
+    def clean(cls):
+        """增强的清理方法，彻底释放模型及关联资源"""
+        # 清理 chat_handler
+        if cls.chat_handler is not None:
+            try:
+                # 1. 关闭 ExitStack（触发 mtmd_free）
+                if hasattr(cls.chat_handler, '_exit_stack') and cls.chat_handler._exit_stack is not None:
+                    try:
+                        cls.chat_handler._exit_stack.close()
+                    except Exception:
+                        pass
 
-    @classmethod
-    def clean(cls, all=False):
+                # 2. 遍历可能的 clip/mmproj 属性并尝试关闭
+                clip_attrs = ["clip_model", "_clip_model", "mmproj", "_mmproj", "clf"]
+                for attr_name in clip_attrs:
+                    if hasattr(cls.chat_handler, attr_name):
+                        attr = getattr(cls.chat_handler, attr_name)
+                        if attr is not None:
+                            if hasattr(attr, "close"):
+                                try:
+                                    attr.close()
+                                except Exception:
+                                    pass
+                            elif hasattr(attr, "__del__"):
+                                try:
+                                    attr.__del__()
+                                except Exception:
+                                    pass
+                            setattr(cls.chat_handler, attr_name, None)
+                # 尝试调用 chat_handler 自身的 close（如果存在）
+                if hasattr(cls.chat_handler, "close"):
+                    try:
+                        cls.chat_handler.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            del cls.chat_handler
+            cls.chat_handler = None
+
+        # 清理 Llama 实例
         if cls.llm is not None:
             try:
                 cls.llm.close()
             except Exception:
                 pass
+            del cls.llm
             cls.llm = None
 
-        if cls.chat_handler is not None:
+        cls.current_config = None
+        gc.collect()
+        gc.collect()  # 双重收集以打破循环引用
+
+        # 调用 llama_backend_free（若可用且是最终清理）
+        if llama_backend_free is not None:
             try:
-                if hasattr(cls.chat_handler, '_exit_stack'):
-                    cls.chat_handler._exit_stack.close()
+                llama_backend_free()
             except Exception:
                 pass
-            cls.chat_handler = None
 
-        cls.current_config = None
-        if all:
-            cls.clean_state()
-        gc.collect()
+        # 清理 CUDA 缓存
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+
         mm.soft_empty_cache()
 
     @classmethod
     def load_model(cls, config):
-        def get_chat_handler(chat_handler):
-            if chat_handler in ("Qwen3.5-Thinking", "Qwen3.6-Thinking", "Qwen3.5", "Qwen3.6"):
-                chat_handler = "Qwen3.5/3.6"
-            if chat_handler in ("Qwen3-VL-Thinking",):
-                chat_handler = "Qwen3-VL"
-            if chat_handler in ("MiniCPM-v4.5-Thinking",):
-                chat_handler = "MiniCPM-v4.5"
-            if chat_handler in ("GLM-4.6V-Thinking",):
-                chat_handler = "GLM-4.6V"
-            if chat_handler in ("GLM-4.1V-Thinking",):
-                chat_handler = "GLM-4.1V"
-
-            match chat_handler:
-                case "Qwen3.5/3.6":
-                    if Qwen35ChatHandler is None:
-                        raise ImportError("Qwen35ChatHandler not available. Please install JamePeng/llama-cpp-python.")
-                    return Qwen35ChatHandler
-                case "Qwen3-VL":
-                    if Qwen3VLChatHandler is None:
-                        raise ImportError("Qwen3VLChatHandler not available.")
-                    return Qwen3VLChatHandler
-                case "Qwen2.5-VL":
-                    if Qwen25VLChatHandler is None:
-                        raise ImportError("Qwen25VLChatHandler not available.")
-                    return Qwen25VLChatHandler
-                case "LLaVA-1.5":
-                    return Llava15ChatHandler
-                case "LLaVA-1.6":
-                    return Llava16ChatHandler
-                case "Moondream2":
-                    return MoondreamChatHandler
-                case "nanoLLaVA":
-                    return NanoLlavaChatHandler
-                case "llama3-Vision-Alpha":
-                    return Llama3VisionAlphaChatHandler
-                case "MiniCPM-v2.6":
-                    return MiniCPMv26ChatHandler
-                case "MiniCPM-v4.5":
-                    return MiniCPMv26ChatHandler
-                case "Gemma3":
-                    if Gemma3ChatHandler is None:
-                        raise ImportError("Gemma3ChatHandler not available.")
-                    return Gemma3ChatHandler
-                case "Gemma4":
-                    if Gemma4ChatHandler is None:
-                        raise ImportError("Gemma4ChatHandler not available. Please install JamePeng/llama-cpp-python with Gemma4 support.")
-                    return Gemma4ChatHandler
-                case "GLM-4.6V":
-                    if GLM46VChatHandler is None:
-                        raise ImportError("GLM46VChatHandler not available.")
-                    return GLM46VChatHandler
-                case "GLM-4.1V":
-                    if GLM41VChatHandler is None:
-                        raise ImportError("GLM41VChatHandler not available.")
-                    return GLM41VChatHandler
-                case "LFM2-VL":
-                    if LFM2VLChatHandler is None:
-                        raise ImportError("LFM2VLChatHandler not available.")
-                    return LFM2VLChatHandler
-                case "LFM2.5-VL":
-                    if LFM25VLChatHandler is None:
-                        raise ImportError("LFM25VLChatHandler not available.")
-                    return LFM25VLChatHandler
-                case "Granite-Docling":
-                    if GraniteDoclingChatHandler is None:
-                        raise ImportError("GraniteDoclingChatHandler not available.")
-                    return GraniteDoclingChatHandler
-                case "None":
-                    return None
-                case _:
-                    raise ValueError(f'Unknown chat_handler: "{chat_handler}"')
-
-        cls.clean(all=True)
-        cls.current_config = config.copy()
         model = config["model"]
         mmproj = config["mmproj"]
-        chat_handler = config["chat_handler"]
+        chat_handler_choice = config["chat_handler"]
         n_ctx = config["n_ctx"]
         vram_limit = config["vram_limit"]
-        image_max_tokens = config["image_max_tokens"]
-        image_min_tokens = config["image_min_tokens"]
+        image_min_tokens = config.get("image_min_tokens", 1024)   # 默认1024
+        image_max_tokens = config.get("image_max_tokens", 0)
+        disable_thinking = config.get("disable_thinking", True)
+        custom_template_file = config.get("custom_template_file", "None")
+        chat_format_override_input = config.get("chat_format_override", "")
+        ctx_checkpoints = config.get("ctx_checkpoints", 0)
+        flash_attn = config.get("flash_attn", True)
+        offload_kqv = config.get("offload_kqv", True)
+        use_mmap = config.get("use_mmap", True)
+
+        # ---------- 1. 解析 chat_format ----------
+        final_chat_format = None
+        if custom_template_file != "None":
+            if chat_handler_choice != "Generic MTMD":
+                print(f"[llama-cpp_vlm] WARNING: custom_template_file selected but chat_handler is '{chat_handler_choice}'. Automatically switching to 'Generic MTMD'.")
+                chat_handler_choice = "Generic MTMD"
+            jinja_path = os.path.join(JINJA_DIR, custom_template_file)
+            if os.path.exists(jinja_path):
+                try:
+                    with open(jinja_path, 'r', encoding='utf-8') as f:
+                        final_chat_format = f.read().strip()
+                    print(f"[llama-cpp_vlm] Loaded custom jinja template from: {jinja_path}")
+                except Exception as e:
+                    print(f"[llama-cpp_vlm] ERROR reading custom jinja file: {e}")
+            else:
+                print(f"[llama-cpp_vlm] WARNING: Custom jinja file not found: {jinja_path}")
+
+        if chat_handler_choice in BUILTIN_CHAT_FORMATS:
+            if final_chat_format is None:
+                pass
+        if chat_handler_choice == "Generic MTMD" and final_chat_format is None and chat_format_override_input.strip():
+            final_chat_format = chat_format_override_input.strip()
+            print(f"[llama-cpp_vlm] Using manually entered template")
+
+        # ---------- 2. 构建 chat_handler ----------
+        mmproj_path = None
+        if mmproj not in (None, "None"):
+            mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
+            if not os.path.exists(mmproj_path):
+                raise ValueError(f"mmproj file not found: {mmproj_path}")
+
         n_gpu_layers = -1
-
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
-
-        # ========== 智能处理 chat_handler 与 mmproj 的关系 ==========
-        if mmproj in (None, "None"):
-            if chat_handler != "None":
-                print(f"[llama-cpp_vlm] WARNING: mmproj is not provided, but chat_handler='{chat_handler}' is specified.")
-                print(f"[llama-cpp_vlm] Forcing chat_handler to 'None' to use GGUF built-in chat template.")
-                chat_handler = "None"
-            handler = None
-            handler_kwargs = {}
-        else:
-            if chat_handler == "None":
-                raise ValueError(f"mmproj '{mmproj}' requires a non-None chat_handler (e.g., Qwen2.5-VL, LLaVA-1.5, etc.).")
-            handler = get_chat_handler(chat_handler)
-            handler_kwargs = {"verbose": False}
-            if _MTMD:
-                handler_kwargs["image_max_tokens"] = image_max_tokens
-                handler_kwargs["image_min_tokens"] = image_min_tokens
-
-        # VRAM 计算（仅多模态时需要）
-        if vram_limit != -1 and mmproj not in (None, "None"):
+        if mmproj_path is not None and vram_limit != -1:
             try:
                 gguf_layers = get_layer_count(model_path) or 32
                 gguf_size = os.path.getsize(model_path) * 1.2 / (1024 ** 3)
                 gguf_layer_size = max(gguf_size / gguf_layers, 0.05)
+                mmproj_size = os.path.getsize(mmproj_path) * 1.2 / (1024 ** 3)
+                if vram_limit - mmproj_size <= 0:
+                    print("[llama-cpp_vlm] VRAM limit too low, forcing CPU offload.")
+                    n_gpu_layers = 0
+                else:
+                    n_gpu_layers = min(gguf_layers, max(1, int((vram_limit - mmproj_size) / gguf_layer_size)))
             except Exception as e:
                 print(f"[llama-cpp_vlm] VRAM calculation failed: {e}, falling back to -1")
                 n_gpu_layers = -1
 
-        # 加载 mmproj（多模态模型）
-        if mmproj not in (None, "None"):
-            mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
-            if vram_limit != -1 and n_gpu_layers != -1:
-                mmproj_size = os.path.getsize(mmproj_path) * 1.2 / (1024 ** 3)
-                if vram_limit - mmproj_size <= 0:
-                    print(f"[llama-cpp_vlm] VRAM limit {vram_limit}GB too low for mmproj {mmproj_size:.2f}GB, forcing CPU offload")
-                    n_gpu_layers = 0
-                else:
-                    n_gpu_layers = min(gguf_layers, max(1, int((vram_limit - mmproj_size) / gguf_layer_size)))
-            print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
-            handler_kwargs["clip_model_path"] = mmproj_path
-        else:
-            # 纯文本模型：无需 mmproj 路径
-            pass
+        cls.chat_handler = None
 
-        # 基于 chat_handler 或模型文件名检测
-        is_qwen = False
-        # 首先检查 chat_handler 是否包含 "Qwen"
-        if "qwen" in chat_handler.lower():
-            is_qwen = True
-        # 其次检查模型文件名（不区分大小写）
-        elif "qwen" in model.lower():
-            is_qwen = True
-
-        chat_template_kwargs = {}
-        if is_qwen:
-            chat_template_kwargs["enable_thinking"] = False
-            print("[llama-cpp_vlm] Qwen model detected, automatically disabling thinking via chat_template_kwargs.")
-
-
-        # 实例化 chat_handler（只有多模态模型需要）
-        if handler is not None:
-            try:
-                cls.chat_handler = handler(**handler_kwargs)
-            except Exception as e:
-                raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
-        else:
+        if chat_handler_choice == "None":
+            if mmproj_path is not None:
+                raise ValueError("mmproj provided but chat_handler is 'None'. Please select 'Generic MTMD' or a built-in multimodal template.")
             cls.chat_handler = None
-            print("[llama-cpp_vlm] Pure text model: chat_handler set to None. Will use GGUF built-in chat template if available.")
+            print("[llama-cpp_vlm] Pure text mode: chat_handler set to None.")
 
+        elif chat_handler_choice == "Generic MTMD":
+            if mmproj_path is None:
+                raise ValueError("mmproj not provided but 'Generic MTMD' selected. Please provide mmproj or choose 'None' for pure text.")
+            handler_kwargs = {
+                "mmproj_path": mmproj_path,
+                "verbose": False,
+                "image_min_tokens": image_min_tokens,
+                "image_max_tokens": image_max_tokens,
+                "chat_format": final_chat_format,
+            }
+            extra_args = {"enable_thinking": not disable_thinking}
+            handler_kwargs["extra_template_arguments"] = extra_args
+            try:
+                cls.chat_handler = GenericMTMDChatHandler(**handler_kwargs)
+                print(f"[llama-cpp_vlm] Using GenericMTMDChatHandler with enable_thinking={not disable_thinking}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to instantiate GenericMTMDChatHandler: {e}")
+
+        elif chat_handler_choice in BUILTIN_CHAT_FORMATS:
+            if mmproj_path is None:
+                raise ValueError(f"mmproj not provided but '{chat_handler_choice}' selected. Please provide mmproj.")
+            handler_class = handler_class_map[chat_handler_choice]
+            handler_kwargs = {
+                "mmproj_path": mmproj_path,
+                "verbose": False,
+                "image_min_tokens": image_min_tokens,
+                "image_max_tokens": image_max_tokens,
+            }
+            # 参数过滤：仅传递 handler 接受的参数
+            sig = inspect.signature(handler_class.__init__)
+            for param_name in ["enable_thinking", "add_vision_id", "preserve_thinking"]:
+                if param_name in sig.parameters:
+                    if param_name == "enable_thinking":
+                        handler_kwargs[param_name] = not disable_thinking
+                    elif param_name == "add_vision_id":
+                        handler_kwargs[param_name] = True
+                    elif param_name == "preserve_thinking":
+                        handler_kwargs[param_name] = False
+            try:
+                cls.chat_handler = handler_class(**handler_kwargs)
+                print(f"[llama-cpp_vlm] Instantiated {chat_handler_choice} with enable_thinking={not disable_thinking}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to instantiate {chat_handler_choice}: {e}")
+
+        # ---------- 3. 加载 Llama 模型 ----------
         print(f"[llama-cpp_vlm] Loading model: {model}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
 
-        cls.llm = Llama(
-            model_path,
-            chat_handler=cls.chat_handler,
-            n_gpu_layers=n_gpu_layers,
-            n_ctx=n_ctx,
-            chat_template_kwargs={"enable_thinking": False}, 
-            verbose=False
-        )
+        chat_template_kwargs = {
+            "enable_thinking": not disable_thinking,
+            "add_vision_id": True,
+        }
+        print(f"[llama-cpp_vlm] chat_template_kwargs: enable_thinking={not disable_thinking}")
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        file_size = os.path.getsize(model_path) / (1024 ** 3)
+        print(f"[llama-cpp_vlm] Model file size: {file_size:.2f} GB")
+
+        verbose_llama = False  # 调试时可开启
+
+        try:
+            cls.llm = Llama(
+                model_path,
+                chat_handler=cls.chat_handler,
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                chat_template_kwargs=chat_template_kwargs,
+                verbose=verbose_llama,
+                ctx_checkpoints=ctx_checkpoints,
+                flash_attn=flash_attn,
+                offload_kqv=offload_kqv,
+                use_mmap=use_mmap,
+            )
+        except Exception as e:
+            # 加载失败，彻底清理
+            cls.clean()
+            raise RuntimeError(
+                f"Failed to load model from {model_path}. "
+                f"File size: {file_size:.2f} GB. "
+                f"use_mmap={use_mmap}. "
+                f"Error: {e}"
+            ) from e
+
+        cls.current_config = config
 
 
 any_type = AnyType("*")
@@ -316,19 +297,17 @@ any_type = AnyType("*")
 if not hasattr(mm, "unload_all_models_backup"):
     mm.unload_all_models_backup = mm.unload_all_models
     def patched_unload_all_models(*args, **kwargs):
-        LLAMA_CPP_STORAGE.clean(all=True)
-        result = mm.unload_all_models_backup(*args, **kwargs)
-        return result
+        LLAMA_CPP_STORAGE.clean()
+        return mm.unload_all_models_backup(*args, **kwargs)
     mm.unload_all_models = patched_unload_all_models
     print("[llama-cpp_vlm] Model cleanup hook applied!")
 
 llm_extensions = ['.ckpt', '.pt', '.bin', '.pth', '.safetensors', '.gguf']
 folder_paths.folder_names_and_paths["LLM"] = ([os.path.join(folder_paths.models_dir, "LLM")], llm_extensions)
 
-# ========== 图像/视频反推预设提示词（已迁移至 .format 风格 + 命名占位符） ==========
+# ========== 预设提示词 ==========
 preset_prompts = {
     "Empty - Nothing": "",
-    "Normal - Describe": "Describe this {media_type}.",
     "Prompt Style - Tags": (
         "Your task is to generate a clean list of comma-separated tags for a text-to-{media_type} AI, based *only* on the visual information in the {media_type}. "
         "Limit the output to a maximum of 50 unique tags. Strictly describe visual elements like subject, clothing, environment, colors, lighting, and composition. "
@@ -339,15 +318,8 @@ preset_prompts = {
     "Prompt Style - Detailed": "Generate a detailed, artistic text-to-{media_type} prompt based on the {media_type}. Combine the subject, their actions, the environment, lighting, and overall mood into a single, cohesive paragraph of about 2-3 sentences. Focus on key visual details.",
     "Prompt Style - Extreme Detailed": "Generate an extremely detailed and descriptive text-to-{media_type} prompt from the {media_type}. Create a rich paragraph that elaborates on the subject's appearance, textures of clothing, specific background elements, the quality and color of light, shadows, and the overall atmosphere. Aim for a highly descriptive and immersive prompt.",
     "Prompt Style - Cinematic": "Act as a master prompt engineer. Create a highly detailed and evocative prompt for an {media_type} generation AI. Describe the subject, their pose, the environment, the lighting, the mood, and the artistic style (e.g., photorealistic, cinematic, painterly). Weave all elements into a single, natural language paragraph, focusing on visual impact.",
-    "Creative - Detailed Analysis": "Describe this {media_type} in detail, breaking down the subject, attire, accessories, background, and composition into separate sections.",
     "Creative - Summarize Video": "Summarize the key events and narrative points in this video.",
     "Creative - Short Story": "Write a short, imaginative story inspired by this {media_type}.",
-    "Creative - Refine & Expand Prompt": (
-        "Refine and enhance the following user prompt for creative text-to-{media_type} generation. "
-        "Keep the meaning and keywords, make it more expressive and visually rich. "
-        "Output **only the improved prompt text itself**, without any reasoning steps, thinking process, or additional commentary.\n\n"
-        "User input: <input>{input}</input>"
-    ),
     "Vision - *Bounding Box": (
         'Locate every instance that belongs to the following categories: "{input}". '
         'Report bbox coordinates in {{"bbox_2d": [x1, y1, x2, y2], "label": "string"}} JSON format as a List.'
@@ -355,10 +327,8 @@ preset_prompts = {
 }
 preset_tags = list(preset_prompts.keys())
 
-# ========== 纯文本扩写预设提示词（使用命名占位符 + XML 标签包裹输入） ==========
 text_preset_prompts = {
     "Empty - Nothing": "",
-
     "扩写-领域自适应": (
         "Role\n你是一位拥有全学科视觉知识的图像生成提示词专家。你的核心能力是：精准识别用户输入关键词的侧重点，自动判定其所属领域（如写实摄影、工业设计、平面海报、二次元动漫、3D动画、数字艺术等），并调用该领域的专业术语进行像素级的深度扩写。\n\n"
         "最高指令 (Absolute Command)\n\n"
@@ -409,7 +379,6 @@ text_preset_prompts = {
         "请直接返回扩展后的完整提示词，不需要解释你的思考过程或添加额外说明。\n\n"
         "Input to expand: <input>{input}</input>"
     ),
-
     "扩写-Tag": (
         "你是一位专业的AI绘画提示词工程师，擅长将简短描述转化为高质量、细节丰富的提示词。请按照以下步骤处理用户输入：\n\n"
         "1. 分析理解：\n"
@@ -434,19 +403,10 @@ text_preset_prompts = {
         "请直接返回扩展后的完整提示词，不需要解释你的思考过程或添加额外说明。\n\n"
         "Input to expand: <input>{input}</input>"
     ),
-
-    "Refine & Expand Prompt": (
-        "You are an expert prompt engineer. Your task is to refine and expand the user's creative text into a highly expressive, vivid, and detailed prompt. "
-        "Add sensory details, emotional tones, and rich vocabulary while preserving the original meaning and keywords. "
-        "The output should be a single, flowing paragraph of 80–150 words that feels immersive and compelling. "
-        "CRITICAL: Output ONLY the final refined prompt. Do not include any reasoning, thinking process, extra commentary, or markdown formatting.\n\n"
-        "User input: <input>{input}</input>"
-    ),
-
     "Expand Prompt for Image Generation": (
         "You are a master prompt engineer specializing in text-to-image generation. "
         "Your task is to expand the short user prompt into a **comprehensive, highly detailed, and visually rich image prompt** that can produce a perfect, high-quality image. "
-        "Incorporate the following elements seamlessly into a single, natural language paragraph (100–200 words):\n"
+        "Incorporate the following elements seamlessly into a single, natural language paragraph (150–300 words):\n"
         "- **Main subject(s):** Physical appearance, clothing, pose, expression, age, ethnicity, distinctive features.\n"
         "- **Environment & background:** Specific location (e.g., \"ancient forest at twilight\", \"cyberpunk alley after rain\"), depth cues, foreground/midground/background details.\n"
         "- **Lighting & atmosphere:** Light source (e.g., \"golden hour sunlight\", \"neon glow\", \"soft window light\"), shadows, mood (e.g., \"mysterious\", \"joyful\", \"melancholic\"), weather or time of day.\n"
@@ -460,7 +420,6 @@ text_preset_prompts = {
         "- Do NOT repeat the original short prompt verbatim; integrate it naturally.\n\n"
         "Short prompt: <input>{input}</input>"
     ),
-
     "Expand Prompt for Video Generation": (
         "You are an expert prompt engineer for text-to-video AI models (e.g., Sora, Runway Gen-3, Pika Labs). "
         "Your task is to expand a short user prompt into a **detailed, temporally coherent, and visually dynamic video prompt** (150–250 words). "
@@ -481,13 +440,36 @@ text_preset_prompts = {
 }
 text_preset_tags = list(text_preset_prompts.keys())
 
+preset_map = {
+    "Qwen-Image [EN]": QWEN_IMAGE_EN, "Qwen-Image [ZH]": QWEN_IMAGE_ZH,
+    "Qwen-Image 2512 [EN]": QWEN_IMAGE_2512_EN, "Qwen-Image 2512 [ZH]": QWEN_IMAGE_2512_ZH,
+    "Qwen-Image-Edit": QWEN_IMAGE_EDIT, "Qwen-Image-Edit 2509": QWEN_IMAGE_EDIT_2509,
+    "Qwen-Image-Edit 2511": QWEN_IMAGE_EDIT_2511, "Z-Image Turbo": ZIMAGE_TURBO,
+    "Flux.2 T2I": FLUX2_T2I, "Flux.2 I2I": FLUX2_I2I,
+    "Wan T2V [EN]": WAN_T2V_EN, "Wan T2V [ZH]": WAN_T2V_ZH,
+    "Wan I2V [EN]": WAN_I2V_EN, "Wan I2V [ZH]": WAN_I2V_ZH,
+    "Wan I2V Full-Auto [EN]": WAN_I2V_EMPTY_EN, "Wan I2V Full-Auto [ZH]": WAN_I2V_EMPTY_ZH,
+    "Wan FLF2V [EN]": WAN_FLF2V_EN, "Wan FLF2V [ZH]": WAN_FLF2V_ZH,
+    "喵呜图片精细反推": 喵呜图片精细反推, "扩写_人像大师": 扩写_人像大师,
+    "扩写_Tags风格": 扩写_Tags风格, "图像描述_Tag风格": 图像描述_Tag风格,
+    "像素级描述_阿丹": 像素级描述_阿丹, "黑兽": 黑兽,
+    "图像编辑重绘_CJL": 图像编辑重绘_CJL, "图像到视频提示词_CJL": 图像到视频提示词_CJL,
+    "全图反推_中文": 全图反推_中文, "WAN分镜规则": WAN分镜规则,
+    "ideogram4": ideogram4, "性感古风扩写": 性感古风扩写,
+    "Z_Engineer": Z_Engineer, "中文文生图": 中文文生图,"英文NSFW_Krea2": 英文NSFW_Krea2, "东亚女性扩写": 东亚女性扩写,"图片反推东亚女性": 图片反推东亚女性,
+}
 
-def image2base64(image):
-    img = Image.fromarray(image)
+
+def comfy_tensor_to_np(image_tensor):
+    return (torch.clamp(image_tensor * 255.0, 0.0, 255.0)
+            .cpu().numpy().astype(np.uint8).squeeze())
+
+
+def image2base64(image_np):
+    img = Image.fromarray(image_np)
     buffered = io.BytesIO()
     img.save(buffered, format="JPEG", quality=85)
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    return img_base64
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
 def parse_json(json_str):
@@ -505,18 +487,19 @@ def parse_json(json_str):
         raise ValueError(f"Unable to load JSON data!\n{e}\nRaw: {json_str[:300]}")
 
 
-def scale_image(image: torch.Tensor, max_size: int = 128):
-    img_np = np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+def scale_image(image_tensor: torch.Tensor, max_size: int = 128):
+    img_np = comfy_tensor_to_np(image_tensor)
     img_pil = Image.fromarray(img_np)
     w, h = img_pil.size
     scale = min(max_size / max(w, h), 1.0)
-    new_w, new_h = int(w * scale), int(h * scale)
-    img_resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    return np.array(img_resized)
+    if scale < 1.0:
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return np.array(img_pil)
 
 
 def qwen3bbox(image, json, coord_scale=1000):
-    img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+    img = Image.fromarray(comfy_tensor_to_np(image))
     bboxes = []
     for item in json:
         x0, y0, x1, y1 = item["bbox_2d"]
@@ -530,7 +513,7 @@ def qwen3bbox(image, json, coord_scale=1000):
 
 def draw_bbox(image, json, mode, coord_scale=1000):
     label_colors = {}
-    img = Image.fromarray(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+    img = Image.fromarray(comfy_tensor_to_np(image))
     draw = ImageDraw.Draw(img)
     for item in json:
         try:
@@ -547,7 +530,6 @@ def draw_bbox(image, json, mode, coord_scale=1000):
             x1 = x1 / coord_scale * img.width
             y1 = y1 / coord_scale * img.height
         bbox = (x0, y0, x1, y1)
-
         if label not in label_colors:
             label_colors[label] = tuple(random.randint(80, 180) for _ in range(3))
         color = label_colors[label]
@@ -559,7 +541,42 @@ def draw_bbox(image, json, mode, coord_scale=1000):
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
 
 
-# ================== NODES ==================
+def frames_to_mp4_base64(frames: list, fps: int = 2) -> str:
+    tmp_dir = tempfile.mkdtemp()
+    img_pattern = os.path.join(tmp_dir, "frame_%05d.png")
+    for idx, frame in enumerate(frames):
+        img = Image.fromarray(frame)
+        img.save(img_pattern % idx)
+    output_path = os.path.join(tmp_dir, "output.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", img_pattern,
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        output_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg encoding failed: {e.stderr.decode()}")
+    with open(output_path, "rb") as f:
+        video_bytes = f.read()
+    b64 = base64.b64encode(video_bytes).decode()
+    import shutil
+    shutil.rmtree(tmp_dir)
+    return f"data:video/mp4;base64,{b64}"
+
+
+def clean_think_tags(text: str) -> str:
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'</?think>', '', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ================== 核心节点 ==================
 
 class llama_cpp_model_loader:
     @classmethod
@@ -571,11 +588,22 @@ class llama_cpp_model_loader:
             "required": {
                 "model": (model_list,),
                 "mmproj": (mmproj_list, {"default": "None"}),
-                "chat_handler": (chat_handlers, {"default": "None"}),
-                "n_ctx": ("INT", {"default": 8192, "min": 1024, "max": 327680, "step": 128}),
+                "chat_handler": (chat_handlers, {"default": "Generic MTMD"}),
+                "n_ctx": ("INT", {"default": 16384, "min": 1024, "max": 327680, "step": 128}),
                 "vram_limit": ("INT", {"default": -1, "min": -1, "max": 1024, "step": 1}),
-                "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "image_min_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 32}),
                 "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+                "disable_thinking": ("BOOLEAN", {"default": True}),
+                "custom_template_file": (JINJA_FILE_LIST, {"default": "None"}),
+                "chat_format_override": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Paste custom template content here (only used when chat_handler is 'Generic MTMD' and no file selected)"
+                }),
+                "ctx_checkpoints": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1}),
+                "flash_attn": ("BOOLEAN", {"default": True}),
+                "offload_kqv": ("BOOLEAN", {"default": True}),
+                "use_mmap": ("BOOLEAN", {"default": True}),
             }
         }
     RETURN_TYPES = ("LLAMACPPMODEL",)
@@ -583,7 +611,10 @@ class llama_cpp_model_loader:
     FUNCTION = "loadmodel"
     CATEGORY = "llama-cpp-vlm"
 
-    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens):
+    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit,
+                  image_min_tokens, image_max_tokens, disable_thinking,
+                  custom_template_file, chat_format_override,
+                  ctx_checkpoints, flash_attn, offload_kqv, use_mmap):
         custom_config = {
             "model": model,
             "mmproj": mmproj,
@@ -592,15 +623,29 @@ class llama_cpp_model_loader:
             "vram_limit": vram_limit,
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,
+            "disable_thinking": disable_thinking,
+            "custom_template_file": custom_template_file,
+            "chat_format_override": chat_format_override,
+            "ctx_checkpoints": ctx_checkpoints,
+            "flash_attn": flash_attn,
+            "offload_kqv": offload_kqv,
+            "use_mmap": use_mmap,
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
-            print("[llama-cpp_vlm] Loading model...")
-            LLAMA_CPP_STORAGE.load_model(custom_config)
+            print("[llama-cpp_vlm] Configuration changed or new load. Cleaning old instances...")
+            LLAMA_CPP_STORAGE.clean()
+            try:
+                LLAMA_CPP_STORAGE.load_model(custom_config)
+            except Exception as e:
+                LLAMA_CPP_STORAGE.clean()
+                mm.soft_empty_cache()
+                print(f"[llama-cpp_vlm] Model loading failed: {e}")
+                raise RuntimeError(f"Model loading failed: {e}") from e
+            LLAMA_CPP_STORAGE.current_config = custom_config
         return (custom_config,)
 
 
 class llama_cpp_instruct_adv:
-    """图片/视频反推节点（已升级为 .format + 命名占位符，并兼容自动聊天模板）"""
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -613,10 +658,8 @@ class llama_cpp_instruct_adv:
                 "max_frames": ("INT", {"default": 24, "min": 2, "max": 1024, "step": 1}),
                 "max_size": ("INT", {"default": 256, "min": 128, "max": 16384, "step": 64}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
-                "force_offload": ("BOOLEAN", {"default": False}),
-                "save_states": ("BOOLEAN", {"default": False}),
+                "force_offload": ("BOOLEAN", {"default": True}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
             "optional": {
                 "parameters": ("LLAMACPPARAMS",),
                 "images": ("IMAGE",),
@@ -624,77 +667,49 @@ class llama_cpp_instruct_adv:
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "INT")
-    RETURN_NAMES = ("output", "output_list", "state_uid")
-    OUTPUT_IS_LIST = (False, True, False)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output", "output_list")
+    OUTPUT_IS_LIST = (False, True)
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
 
-    def sanitize_messages(self, messages):
-        clean_messages = messages.copy()
-        for msg in clean_messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "image_url":
-                        item["image_url"]["url"] = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADElEQVQImWP4//8/AAX+Av5Y8msOAAAAAElFTkSuQmCC"
-        return clean_messages
-
     def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, inference_mode,
-                max_frames, max_size, seed, force_offload, save_states, unique_id,
+                max_frames, max_size, seed, force_offload,
                 parameters=None, images=None, queue_handler=None):
-        if not LLAMA_CPP_STORAGE.llm:
-            LLAMA_CPP_STORAGE.load_model(llama_model)
+        config = llama_model
+        if LLAMA_CPP_STORAGE.llm is None or LLAMA_CPP_STORAGE.current_config != config:
+            print("[llama-cpp_vlm] Model not loaded or config changed. Loading...")
+            LLAMA_CPP_STORAGE.clean()
+            LLAMA_CPP_STORAGE.load_model(config)
 
-        # 图片/视频反推专用默认参数（在遵循原图的基础上增加适度创意）
         if parameters is None:
             parameters = {
-                "max_tokens": 1024,
-                "top_k": 40,
-                "top_p": 0.92,
-                "min_p": 0.05,
-                "typical_p": 1.0,
-                "temperature": 0.75,
-                "repeat_penalty": 1.1,
-                "frequency_penalty": 0.2,
-                "presence_penalty": 0.3,
-                "mirostat_mode": 0,
-                "mirostat_eta": 0.1,
-                "mirostat_tau": 5.0,
-                "reasoning_budget": 0,
+                "max_tokens": 1024, "top_k": 40, "top_p": 0.92, "min_p": 0.05,
+                "typical_p": 1.0, "temperature": 0.75, "repeat_penalty": 1.1,
+                "frequency_penalty": 0.2, "mirostat_mode": 0, "mirostat_eta": 0.1,
+                "mirostat_tau": 5.0, "reasoning_budget": 0,
             }
 
-        if _MTMD:
-            parameters.pop("presence_penalty", None)
-
-        _uid = parameters.get("state_uid", None)
         _parameters = parameters.copy()
-        _parameters.pop("state_uid", None)
+        if _parameters.get("min_p", 0) == 0:
+            _parameters.pop("min_p", None)
+
+        disable_thinking = llama_model.get("disable_thinking", True)
+        if disable_thinking:
+            _parameters["reasoning_budget"] = 0
+        else:
+            if _parameters.get("reasoning_budget", 0) == 0:
+                _parameters["reasoning_budget"] = -1
+
         reasoning_budget = _parameters.pop("reasoning_budget", 0)
 
-        uid = unique_id.rpartition('.')[-1] if _uid in (None, -1) else _uid
-
-        last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
         video_input = inference_mode == "video"
         system_prompts = "请将输入的图片序列当做视频而不是静态帧序列, " + system_prompt if video_input else system_prompt
-        if last_sys_prompt != system_prompts:
-            messages = []
-            LLAMA_CPP_STORAGE.clean_state()
-            LLAMA_CPP_STORAGE.sys_prompts[f"{uid}"] = system_prompts
-            if system_prompts.strip():
-                messages.append({"role": "system", "content": system_prompts})
-        else:
-            if save_states:
-                try:
-                    print(f"[llama-cpp_vlm] Loading state and history id={uid}...")
-                    messages = LLAMA_CPP_STORAGE.messages.get(f"{uid}", [])
-                except Exception:
-                    messages = []
-            else:
-                messages = []
 
-        out1 = ""
-        out2 = []
+        messages = []
+        if system_prompts.strip():
+            messages.append({"role": "system", "content": system_prompts})
+
         user_content = []
         if custom_prompt.strip() and "*" not in preset_prompt:
             user_content.append({"type": "text", "text": custom_prompt})
@@ -705,18 +720,18 @@ class llama_cpp_instruct_adv:
                 p = template.format(input=custom_prompt.strip(), media_type=media_type)
             except KeyError as e:
                 missing = e.args[0]
-                print(f"[WARN] Preset '{preset_prompt}' missing placeholder {{{missing}}}. Appending input.")
                 p = f"{template}\n\n{missing.capitalize()}: {custom_prompt.strip()}"
             user_content.append({"type": "text", "text": p})
 
-        # 判断是否有图像输入
         has_images = images is not None and (
             (isinstance(images, torch.Tensor) and images.numel() > 0) or
             (isinstance(images, list) and len(images) > 0)
         )
 
+        out1 = ""
+        out2 = []
+
         if not has_images:
-            # 纯文本场景：将 user_content 从列表转换为纯字符串，以兼容自动聊天模板
             if user_content and isinstance(user_content, list) and len(user_content) == 1 and user_content[0]["type"] == "text":
                 user_content = user_content[0]["text"]
             messages.append({"role": "user", "content": user_content})
@@ -727,80 +742,100 @@ class llama_cpp_instruct_adv:
             out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
             out2 = [out1]
         else:
-            # 有图像输入：必须使用多模态 chat_handler，content 保持列表格式
-            if not hasattr(LLAMA_CPP_STORAGE.chat_handler, "clip_model_path") or LLAMA_CPP_STORAGE.chat_handler.clip_model_path is None:
-                raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
+            if not hasattr(LLAMA_CPP_STORAGE.chat_handler, "mmproj_path") or LLAMA_CPP_STORAGE.chat_handler.mmproj_path is None:
+                raise ValueError("Image input detected, but mmproj not loaded.")
 
             frames = images
             if video_input:
                 indices = np.linspace(0, len(images) - 1, max_frames, dtype=int)
                 frames = [images[i] for i in indices]
 
-            if inference_mode == "one by one":
-                tmp_list = []
-                base_user_content = [
-                    {"type": "text", "text": user_content[0]["text"]},
-                    {"type": "image_url", "image_url": {"url": ""}}
-                ]
-                messages.append({"role": "user", "content": base_user_content})
-                print(f"[llama-cpp_vlm] Start processing {len(frames)} images")
+            use_native_video = False
+            if video_input and hasattr(LLAMA_CPP_STORAGE.chat_handler, '_mtmd_tokenize'):
+                try:
+                    _ = LLAMA_CPP_STORAGE.chat_handler._mtmd_tokenize
+                    use_native_video = True
+                except Exception:
+                    pass
 
-                for i, image in enumerate(frames):
-                    if mm.processing_interrupted():
-                        raise mm.InterruptProcessingException()
-                    data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                    current_content = messages[-1]["content"]
-                    for item in current_content:
-                        if item.get("type") == "image_url":
-                            item["image_url"]["url"] = f"data:image/jpeg;base64,{data}"
-                            break
+            if use_native_video:
+                np_frames = [comfy_tensor_to_np(f) for f in frames]
+                try:
+                    video_data_uri = frames_to_mp4_base64(np_frames, fps=2)
+                    user_content.append({"type": "video_url", "video_url": {"url": video_data_uri}})
+                    messages.append({"role": "user", "content": user_content})
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
                         messages=messages, seed=seed, reasoning_budget=reasoning_budget,
                         **_parameters
                     )
-                    text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                    out2.append(text)
-                    if len(frames) > 1:
-                        tmp_list.append(f"====== Image {i+1} ======")
-                    tmp_list.append(text)
-                    for item in current_content:
-                        if item.get("type") == "image_url":
-                            item["image_url"]["url"] = ""
-                out1 = "\n\n".join(tmp_list)
-            else:
-                for image in frames:
-                    if len(frames) > 1:
-                        data = image2base64(scale_image(image, max_size))
-                    else:
-                        data = image2base64(np.clip(255.0 * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
-                    user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
-                messages.append({"role": "user", "content": user_content})
-                output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                    messages=messages, seed=seed, reasoning_budget=reasoning_budget,
-                    **_parameters
-                )
-                out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                out2 = [out1]
+                    out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                    out2 = [out1]
+                except Exception as e:
+                    print(f"[llama-cpp_vlm] Native video encoding failed: {e}. Falling back to image frames.")
+                    use_native_video = False
 
-        if save_states:
-            print(f"[llama-cpp_vlm] Saving state id={uid}...")
-            messages.append({"role": "assistant", "content": out1})
-            clear_message = self.sanitize_messages(messages)
-            LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
-        else:
-            if not LLAMA_CPP_STORAGE.messages.get(f"{uid}"):
-                LLAMA_CPP_STORAGE.sys_prompts.pop(f"{uid}", None)
+            if not use_native_video:
+                if inference_mode == "one by one":
+                    tmp_list = []
+                    base_user_content = [
+                        {"type": "text", "text": user_content[0]["text"]},
+                        {"type": "image_url", "image_url": {"url": ""}}
+                    ]
+                    messages.append({"role": "user", "content": base_user_content})
+                    print(f"[llama-cpp_vlm] Start processing {len(frames)} images")
+
+                    for i, image in enumerate(frames):
+                        if mm.processing_interrupted():
+                            raise mm.InterruptProcessingException()
+
+                        data = image2base64(comfy_tensor_to_np(image))
+                        current_content = messages[-1]["content"]
+
+                        for item in current_content:
+                            if item.get("type") == "image_url":
+                                item["image_url"]["url"] = f"data:image/jpeg;base64,{data}"
+
+                        output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
+                            messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                            **_parameters
+                        )
+                        text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                        out2.append(text)
+                        if len(frames) > 1:
+                            tmp_list.append(f"====== Image {i+1} ======")
+                        tmp_list.append(text)
+
+                        for item in current_content:
+                            if item.get("type") == "image_url":
+                                item["image_url"]["url"] = ""
+                    out1 = "\n\n".join(tmp_list)
+                else:
+                    for image in frames:
+                        if len(frames) > 1:
+                            data = image2base64(scale_image(image, max_size))
+                        else:
+                            data = image2base64(comfy_tensor_to_np(image))
+                        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
+
+                    messages.append({"role": "user", "content": user_content})
+                    output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
+                        messages=messages, seed=seed, reasoning_budget=reasoning_budget,
+                        **_parameters
+                    )
+                    out1 = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+                    out2 = [out1]
+
+        if disable_thinking:
+            out1 = clean_think_tags(out1)
+            out2 = [clean_think_tags(s) for s in out2]
 
         if force_offload:
             LLAMA_CPP_STORAGE.clean()
 
-        del messages
-        gc.collect()
-        return (out1, out2, uid)
+        return (out1, out2)
 
 
 class llama_cpp_text_enhancer:
-    """纯文本扩写/润色节点，使用 .format + XML 标签包裹输入，强制禁用思考模式，并采用高创意默认参数"""
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -810,10 +845,8 @@ class llama_cpp_text_enhancer:
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
                 "system_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
-                "force_offload": ("BOOLEAN", {"default": False}),
-                "save_states": ("BOOLEAN", {"default": False}),
+                "force_offload": ("BOOLEAN", {"default": True}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
             "optional": {
                 "parameters": ("LLAMACPPARAMS",),
             },
@@ -824,62 +857,49 @@ class llama_cpp_text_enhancer:
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
 
-    def sanitize_messages(self, messages):
-        return messages.copy()
-
     def process(self, llama_model, preset_prompt, custom_prompt, system_prompt,
-                seed, force_offload, save_states, unique_id,
-                parameters=None):
-        if not LLAMA_CPP_STORAGE.llm:
-            LLAMA_CPP_STORAGE.load_model(llama_model)
+                seed, force_offload, parameters=None):
+        config = llama_model
+        if LLAMA_CPP_STORAGE.llm is None or LLAMA_CPP_STORAGE.current_config != config:
+            print("[llama-cpp_vlm] Model not loaded or config changed. Loading...")
+            LLAMA_CPP_STORAGE.clean()
+            LLAMA_CPP_STORAGE.load_model(config)
 
-        # 纯文本扩写专用默认参数（充分发挥创意，同时遵循原意）
+        disable_thinking = llama_model.get("disable_thinking", True)
+
         if parameters is None:
             parameters = {
-                "max_tokens": 1024,
-                "top_k": 60,
-                "top_p": 0.96,
-                "min_p": 0.08,
-                "typical_p": 1.0,
-                "temperature": 0.88,
-                "repeat_penalty": 1.15,
-                "frequency_penalty": 0.25,
-                "presence_penalty": 0.4,
-                "mirostat_mode": 0,
-                "mirostat_eta": 0.1,
-                "mirostat_tau": 5.0,
-                "reasoning_budget": 0,
+                "max_tokens": 1024, "top_k": 60, "top_p": 0.96, "min_p": 0.08,
+                "typical_p": 1.0, "temperature": 0.88, "repeat_penalty": 1.15,
+                "frequency_penalty": 0.25, "mirostat_mode": 0, "mirostat_eta": 0.1,
+                "mirostat_tau": 5.0, "reasoning_budget": 0,
             }
 
-        if _MTMD:
-            parameters.pop("presence_penalty", None)
-
-        _uid = parameters.get("state_uid", None)
         _parameters = parameters.copy()
-        _parameters.pop("state_uid", None)
-        # 强制禁用思考模式
-        _parameters["reasoning_budget"] = 0
+        if _parameters.get("min_p", 0) == 0:
+            _parameters.pop("min_p", None)
 
-        uid = unique_id.rpartition('.')[-1] if _uid in (None, -1) else _uid
-
-        last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
-        if last_sys_prompt != system_prompt:
-            messages = []
-            LLAMA_CPP_STORAGE.clean_state()
-            LLAMA_CPP_STORAGE.sys_prompts[f"{uid}"] = system_prompt
-            if system_prompt.strip():
-                messages.append({"role": "system", "content": system_prompt})
+        if disable_thinking:
+            _parameters["reasoning_budget"] = 0
         else:
-            if save_states:
-                try:
-                    print(f"[llama-cpp_vlm] Loading text state id={uid}...")
-                    messages = LLAMA_CPP_STORAGE.messages.get(f"{uid}", [])
-                except Exception:
-                    messages = []
-            else:
-                messages = []
+            if _parameters.get("reasoning_budget", 0) == 0:
+                _parameters["reasoning_budget"] = -1
 
-        # 构建用户消息（纯文本，必须为字符串）
+        final_system_prompt = system_prompt.strip()
+        if disable_thinking:
+            instruction = (
+                "CRITICAL: Directly output the expanded prompt text. "
+                "Do NOT use any '<think>' tags, and bypass any internal reasoning steps entirely."
+            )
+            if final_system_prompt:
+                final_system_prompt = f"{instruction}\n\n{final_system_prompt}"
+            else:
+                final_system_prompt = instruction
+
+        messages = []
+        if final_system_prompt:
+            messages.append({"role": "system", "content": final_system_prompt})
+
         if preset_prompt == "Empty - Nothing":
             user_content = custom_prompt.strip()
         else:
@@ -887,32 +907,21 @@ class llama_cpp_text_enhancer:
             try:
                 user_content = template.format(input=custom_prompt.strip())
             except KeyError:
-                # 兜底：如果模板缺少 {input} 占位符，则直接拼接
-                print(f"[WARN] Preset '{preset_prompt}' missing '{{input}}' placeholder. Appending input.")
                 user_content = f"{template}\n\nInput: <input>{custom_prompt.strip()}</input>"
 
         messages.append({"role": "user", "content": user_content})
 
-        # 调用模型（纯文本模式）
         output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
             messages=messages, seed=seed, **_parameters
         )
         out_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
 
-        if save_states:
-            print(f"[llama-cpp_vlm] Saving text state id={uid}...")
-            messages.append({"role": "assistant", "content": out_text})
-            clear_message = self.sanitize_messages(messages)
-            LLAMA_CPP_STORAGE.messages[f"{uid}"] = clear_message
-        else:
-            if not LLAMA_CPP_STORAGE.messages.get(f"{uid}"):
-                LLAMA_CPP_STORAGE.sys_prompts.pop(f"{uid}", None)
+        if disable_thinking:
+            out_text = clean_think_tags(out_text)
 
         if force_offload:
             LLAMA_CPP_STORAGE.clean()
 
-        del messages
-        gc.collect()
         return (out_text,)
 
 
@@ -924,21 +933,16 @@ class llama_cpp_parameters:
                 "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 1}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 1000, "step": 1}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_p": ("FLOAT", {"default": 0, "min": 0, "max": 1.0, "step": 0.01}),
                 "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "presence_penalty": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2, "step": 1}),
                 "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "state_uid": ("INT", {"default": -1, "min": -1, "max": 999999, "step": 1}),
                 "reasoning_budget": ("INT", {
-                    "default": 0,
-                    "min": -1,
-                    "max": 32768,
-                    "step": 1,
+                    "default": 0, "min": -1, "max": 32768, "step": 1,
                     "tooltip": "0 = disabled, -1 = unlimited, >0 = limited reasoning tokens"
                 }),
             }
@@ -950,26 +954,6 @@ class llama_cpp_parameters:
 
     def process(self, **kwargs):
         return (kwargs,)
-
-
-class llama_cpp_clean_states:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "any": (any_type,),
-                "state_uid": ("INT", {"default": -1, "min": -1, "max": 999999, "step": 1}),
-            },
-        }
-    RETURN_TYPES = (any_type,)
-    RETURN_NAMES = ("any",)
-    FUNCTION = "process"
-    CATEGORY = "llama-cpp-vlm"
-
-    def process(self, any, state_uid):
-        print(f"[llama-cpp_vlm] Cleaning up saved states {state_uid}...")
-        LLAMA_CPP_STORAGE.clean_state(state_uid)
-        return (any,)
 
 
 class llama_cpp_unload_model:
@@ -987,6 +971,7 @@ class llama_cpp_unload_model:
         return (any,)
 
 
+# ========== 辅助节点 ==========
 class json_to_bbox:
     @classmethod
     def INPUT_TYPES(s):
@@ -1072,10 +1057,6 @@ class SEG:
         self.bbox = bbox
         self.label = label
         self.control_net_wrapper = control_net_wrapper
-    def __repr__(self):
-        return (f"SEG(cropped_image={self.cropped_image}, cropped_mask=shape{self.cropped_mask.shape}, "
-                f"confidence={self.confidence}, bbox={self.bbox}, label='{self.label}'), "
-                f"control_net_wrapper={self.control_net_wrapper}")
 
 
 class bbox_to_segs:
@@ -1100,7 +1081,6 @@ class bbox_to_segs:
         image_for_cropping = image[0]
         for bbox in bboxes:
             if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-                print(f"Warning: Skipping invalid bbox item: {bbox}")
                 continue
             x1, y1, x2, y2 = map(int, bbox)
             x1_exp = x1 - dilation
@@ -1170,7 +1150,6 @@ class bbox_to_mask:
         combined_full_mask = torch.zeros(mask_shape, dtype=torch.float32, device=image.device)
         for bbox in bboxes:
             if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-                print(f"Warning: Skipping invalid bbox item: {bbox}")
                 continue
             x1, y1, x2, y2 = map(int, bbox)
             x1_exp = x1 - dilation
@@ -1246,22 +1225,14 @@ class parse_json_node:
             else:
                 raise ValueError("Key cannot be empty!")
             result["any"].append(val)
-            try:
-                result["string"].append(str(val))
-            except Exception:
-                result["string"].append(val)
-            try:
-                result["int"].append(int(val))
-            except Exception:
-                result["int"].append(val)
-            try:
-                result["float"].append(float(val))
-            except Exception:
-                result["float"].append(val)
-            try:
-                result["boolean"].append(val.lower() == "true")
-            except Exception:
-                result["boolean"].append(val)
+            try: result["string"].append(str(val))
+            except Exception: result["string"].append(val)
+            try: result["int"].append(int(val))
+            except Exception: result["int"].append(val)
+            try: result["float"].append(float(val))
+            except Exception: result["float"].append(val)
+            try: result["boolean"].append(val.lower() == "true")
+            except Exception: result["boolean"].append(val)
         if len(result["any"]) == 1:
             result = {k: v[0] for k, v in result.items()}
         return (result["any"], result["string"], result["int"], result["float"], result["boolean"])
@@ -1307,12 +1278,7 @@ class PromptEnhancerPreset:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "preset": (["Qwen-Image [EN]", "Qwen-Image [ZH]", "Qwen-Image 2512 [EN]", "Qwen-Image 2512 [ZH]",
-                            "Qwen-Image-Edit", "Qwen-Image-Edit 2509", "Qwen-Image-Edit 2511", "Z-Image Turbo",
-                            "Flux.2 T2I", "Flux.2 I2I", "Wan T2V [EN]", "Wan T2V [ZH]", "Wan I2V [EN]", "Wan I2V [ZH]",
-                            "Wan I2V Full-Auto [EN]", "Wan I2V Full-Auto [ZH]", "Wan FLF2V [EN]", "Wan FLF2V [ZH]",
-                            "喵呜图片精细反推", "扩写_人像大师", "扩写_Tags风格", "图像描述_Tag风格", "像素级描述_阿丹",
-                            "黑兽", "图像编辑重绘_CJL", "图像到视频提示词_CJL", "全图反推_中文", "WAN分镜规则","ideogram4","性感古风", "Z_Engineer", "中文文生图"],)
+                "preset": (list(preset_map.keys()),),
             }
         }
     RETURN_TYPES = ("STRING",)
@@ -1321,73 +1287,9 @@ class PromptEnhancerPreset:
     CATEGORY = "llama-cpp-vlm"
 
     def main(self, preset):
-        match preset:
-            case "Qwen-Image [EN]":
-                return (QWEN_IMAGE_EN,)
-            case "Qwen-Image [ZH]":
-                return (QWEN_IMAGE_ZH,)
-            case "Qwen-Image 2512 [EN]":
-                return (QWEN_IMAGE_2512_EN,)
-            case "Qwen-Image 2512 [ZH]":
-                return (QWEN_IMAGE_2512_ZH,)
-            case "Qwen-Image-Edit":
-                return (QWEN_IMAGE_EDIT,)
-            case "Qwen-Image-Edit 2509":
-                return (QWEN_IMAGE_EDIT_2509,)
-            case "Qwen-Image-Edit 2511":
-                return (QWEN_IMAGE_EDIT_2511,)
-            case "Z-Image Turbo":
-                return (ZIMAGE_TURBO,)
-            case "Flux.2 T2I":
-                return (FLUX2_T2I,)
-            case "Flux.2 I2I":
-                return (FLUX2_I2I,)
-            case "Wan T2V [EN]":
-                return (WAN_T2V_EN,)
-            case "Wan T2V [ZH]":
-                return (WAN_T2V_ZH,)
-            case "Wan I2V [EN]":
-                return (WAN_I2V_EN,)
-            case "Wan I2V [ZH]":
-                return (WAN_I2V_ZH,)
-            case "Wan I2V Full-Auto [EN]":
-                return (WAN_I2V_EMPTY_EN,)
-            case "Wan I2V Full-Auto [ZH]":
-                return (WAN_I2V_EMPTY_ZH,)
-            case "Wan FLF2V [EN]":
-                return (WAN_FLF2V_EN,)
-            case "Wan FLF2V [ZH]":
-                return (WAN_FLF2V_ZH,)
-            case "喵呜图片精细反推":
-                return (喵呜图片精细反推,)
-            case "扩写_人像大师":
-                return (扩写_人像大师,)
-            case "扩写_Tags风格":
-                return (扩写_Tags风格,)
-            case "图像描述_Tag风格":
-                return (图像描述_Tag风格,)
-            case "像素级描述_阿丹":
-                return (像素级描述_阿丹,)
-            case "黑兽":
-                return (黑兽,)
-            case "图像编辑重绘_CJL":
-                return (图像编辑重绘_CJL,)
-            case "图像到视频提示词_CJL":
-                return (图像到视频提示词_CJL,)
-            case "全图反推_中文":
-                return (全图反推_中文,)
-            case "WAN分镜规则":
-                return (WAN分镜规则,)
-            case "ideogram4":
-                return (ideogram4,)
-            case "性感古风":
-                return (性感古风,)
-            case "Z_Engineer":
-                return (Z_Engineer,)
-            case "中文文生图":
-                return (中文文生图,)
-            case _:
-                raise ValueError(f'Unknown preset: "{preset}"')
+        if preset not in preset_map:
+            raise ValueError(f'Unknown preset: "{preset}"')
+        return (preset_map[preset],)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1396,12 +1298,11 @@ NODE_CLASS_MAPPINGS = {
     "llama_cpp_text_enhancer": llama_cpp_text_enhancer,
     "llama_cpp_parameters": llama_cpp_parameters,
     "llama_cpp_unload_model": llama_cpp_unload_model,
-    "llama_cpp_clean_states": llama_cpp_clean_states,
-    "parse_json_node": parse_json_node,
     "json_to_bbox": json_to_bbox,
     "bbox_to_segs": bbox_to_segs,
     "bbox_to_mask": bbox_to_mask,
     "bboxes_to_bbox": bboxes_to_bbox,
+    "parse_json_node": parse_json_node,
     "remove_code_block": remove_code_block,
     "PromptEnhancerPreset": PromptEnhancerPreset,
 }
@@ -1412,12 +1313,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_text_enhancer": "Llama-cpp Text Enhancer (Pure Text)",
     "llama_cpp_parameters": "Llama-cpp Parameters",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
-    "llama_cpp_clean_states": "Llama-cpp Clean States",
-    "parse_json_node": "Parse JSON",
     "json_to_bbox": "JSON to BBoxes",
     "bbox_to_segs": "BBoxes to SEGS",
     "bbox_to_mask": "BBoxes to MASK",
     "bboxes_to_bbox": "BBoxes to BBox",
+    "parse_json_node": "Parse JSON",
     "remove_code_block": "Unpack Code Block",
     "PromptEnhancerPreset": "Prompt Enhancer Preset",
 }
